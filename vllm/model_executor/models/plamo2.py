@@ -303,10 +303,7 @@ class Plamo2MambaMixer(nn.Module):
         # Reshaping the projected states as in modeling_plamo.py.
         length = len(hidden_states)
         projected_states = projected_states.reshape(length, self.num_heads, -1)
-        gate, hidden_states = torch.split(
-            projected_states,
-            [self.hidden_size_per_head, self.hidden_size_per_head],
-            dim=-1)
+        gate, hidden_states = projected_states.chunk(2, dim=-1)
         hidden_states = hidden_states.reshape(length, -1).transpose(0, 1)
         gate = gate.reshape(length, -1).transpose(0, 1)
 
