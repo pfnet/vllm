@@ -12,6 +12,7 @@ from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
@@ -31,10 +32,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     composed_weight_loader, default_weight_loader, sharded_weight_loader)
 from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid,
-                                                   SupportsV0Only)
+                                                   SupportsPP, SupportsV0Only)
 from vllm.model_executor.models.mamba_cache import (MambaCacheManager,
                                                     MambaCacheParams)
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import (
+    is_pp_missing_parameter, make_empty_intermediate_tensors_factory,
+    make_layers, maybe_prefix)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
@@ -615,6 +618,12 @@ class Plamo2AttentionDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+ALL_DECODER_LAYER_TYPES = {
+    "attention": Plamo2AttentionDecoderLayer,
+    "mamba": Plamo2MambaDecoderLayer
+}
+
+
 class Plamo2Model(PlamoPreTrainedModel):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -636,22 +645,33 @@ class Plamo2Model(PlamoPreTrainedModel):
             prefix=f"{prefix}.embed_tokens",
         )
 
-        decoder_layers = []
-        for i in range(config.num_hidden_layers):
-            layer_class = Plamo2MambaDecoderLayer if is_mamba(
-                config, i) else Plamo2AttentionDecoderLayer
-            decoder_layers.append(
-                layer_class(
-                    config,
-                    layer_idx=i,
-                    cache_config=cache_config,
-                    quant_config=quant_config,
-                    max_model_len=vllm_config.scheduler_config.max_model_len,
-                    prefix=f"{prefix}.decoder_layers.{i}"))
-        self.layers = nn.ModuleList(decoder_layers)
+        extra_kwargs = {"is_lora_enabled": bool(vllm_config.lora_config)}
+
+        def get_layer(prefix: str):
+            layer_idx = int(prefix.rsplit(".", 1)[1])
+            layer_class = ALL_DECODER_LAYER_TYPES[
+                config.layers_block_type[layer_idx]]
+            return layer_class(
+                config,
+                layer_idx,
+                cache_config,
+                quant_config=quant_config,
+                prefix=prefix,
+                max_model_len=vllm_config.scheduler_config.max_model_len,
+                **extra_kwargs)
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers")
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], config.hidden_size))
+
         self.final_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_init()
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
     def forward(
         self,
@@ -661,12 +681,21 @@ class Plamo2Model(PlamoPreTrainedModel):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # TODO(Shinichi): Implement pipeline parallelism.
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
 
         mamba_cache_index = 0
-        for layer in self.layers:
+        for i, layer in enumerate(
+                self.layers[self.start_layer:self.end_layer]):
+            i = i + self.start_layer
             layer_mamba_cache_params = None
             if isinstance(layer, Plamo2MambaDecoderLayer):
                 layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
@@ -678,12 +707,17 @@ class Plamo2Model(PlamoPreTrainedModel):
                 hidden_states=hidden_states,
                 residual=residual,
                 mamba_cache_params=layer_mamba_cache_params)
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({
+                "hidden_states": hidden_states,
+                "residual": residual
+            })
         hidden_states, _ = self.final_layernorm(hidden_states, residual)
         return hidden_states
 
 
-class Plamo2ForCausalLM(PlamoPreTrainedModel, HasInnerState, IsHybrid,
-                        SupportsV0Only):
+class Plamo2ForCausalLM(PlamoPreTrainedModel, HasInnerState, SupportsPP,
+                        IsHybrid, SupportsV0Only):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -738,8 +772,14 @@ class Plamo2ForCausalLM(PlamoPreTrainedModel, HasInnerState, IsHybrid,
                                                 self.config.vocab_size)
         self.sampler = get_sampler()
 
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
+
         # Initialize weights and apply final processing
         self.post_init()
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
 
     def forward(self,
                 input_ids: torch.Tensor,
@@ -750,7 +790,6 @@ class Plamo2ForCausalLM(PlamoPreTrainedModel, HasInnerState, IsHybrid,
         if self.mamba_cache is None:
             num_mamba_layers = self.model_config.get_num_layers_by_block_type(
                 self.vllm_config.parallel_config, LayerBlockType.mamba)
-
             self.mamba_cache = MambaCacheManager(
                 self.vllm_config, self.lm_head.weight.dtype, num_mamba_layers,
                 *self._get_mamba_cache_shape())
@@ -861,7 +900,9 @@ class Plamo2ForCausalLM(PlamoPreTrainedModel, HasInnerState, IsHybrid,
                 loaded_weight += 1.0 / (5**1.5)
             elif "model.final_layernorm.weight" in name:
                 loaded_weight += 1.0
-
+            # Skip layers on other devices.
+            if is_pp_missing_parameter(name, self):
+                continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
