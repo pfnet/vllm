@@ -195,20 +195,6 @@ def is_mamba(config: PlamoConfig, i: int) -> bool:
     return (i % config.mamba_step) != (config.mamba_step // 2)
 
 
-# TODO(Shinichi): Replace this with RMSNorm.
-def _rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor,
-              eps: float) -> torch.Tensor:
-    input_shape = hidden_states.shape
-    hidden_states = hidden_states.reshape(input_shape[:-1] + weight.shape)
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + eps)
-    hidden_states = hidden_states.to(input_dtype)
-    hidden_states = weight * hidden_states
-    return hidden_states.reshape(input_shape)
-
-
 def _swiglu(h: torch.Tensor) -> torch.Tensor:
     h0, h1 = h.chunk(2, dim=-1)
     return torch.nn.functional.silu(h0) * h1
@@ -260,8 +246,8 @@ class Plamo2MambaMixer(nn.Module):
         # as the bias is added in the selective scan kernel.
         self.dt_proj = ColumnParallelLinear(self.time_step_rank,
                                             self.num_heads,
-                                            bias=False)
-        self.dt_bias = torch.nn.Parameter(get_initial_dt_bias(self.num_heads))
+                                            bias=True,
+                                            skip_bias_add=True)
 
         tp_size = get_tensor_model_parallel_world_size()
         self.A = nn.Parameter(
@@ -354,7 +340,7 @@ class Plamo2MambaMixer(nn.Module):
 
         discrete_time_step = self.dt_proj(time_step)[0].transpose(-2, -1)
         # 3.c perform the recurrence y ← SSM(A, B, C)(x)
-        time_proj_bias = (self.dt_bias.float() if hasattr(
+        time_proj_bias = (self.dt_proj.bias.float() if hasattr(
             self.dt_proj, "bias") else None)
 
         # Broadcasting as in modeling_plamo.py.
@@ -365,7 +351,7 @@ class Plamo2MambaMixer(nn.Module):
         time_proj_bias = time_proj_bias[...,
                                         None].expand(-1,
                                                      self.hidden_size_per_head)
-        time_proj_bias = time_proj_bias.reshape(self.intermediate_size)
+        time_proj_bias = time_proj_bias.reshape(-1)
 
         if attn_metadata.query_start_loc is not None \
             and attn_metadata.context_lens_tensor is not None:
@@ -549,10 +535,16 @@ class Plamo2AttentionDecoderLayer(nn.Module):
             base=self.rope_theta,
             rope_scaling=self.rope_scaling,
         )
-        self.q_weight = torch.nn.Parameter(
-            torch.ones((self.num_heads, config.hidden_size_per_head)))
-        self.k_weight = torch.nn.Parameter(
-            torch.ones((self.num_kv_heads, config.hidden_size_per_head)))
+        self.q_norm = RMSNorm(config.hidden_size_per_head,
+                              eps=config.rms_norm_eps)
+        self.q_norm.weight = torch.nn.Parameter(
+            torch.ones(
+                (self.num_heads * tp_size, config.hidden_size_per_head)))
+        self.k_norm = RMSNorm(config.hidden_size_per_head,
+                              eps=config.rms_norm_eps)
+        self.k_norm.weight = torch.nn.Parameter(
+            torch.ones(
+                (self.num_kv_heads * tp_size, config.hidden_size_per_head)))
 
         self.attn = Attention(
             self.num_heads,
@@ -582,8 +574,12 @@ class Plamo2AttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = _rms_norm(q, self.q_weight, 1e-6)
-        k = _rms_norm(k, self.k_weight, 1e-6)
+        q_shape = q.shape
+        q = q.reshape(q_shape[:-1] + self.q_norm.weight.shape)
+        q = self.q_norm.forward_native(q).reshape(q_shape)
+        k_shape = k.shape
+        k = k.reshape(k_shape[:-1] + self.k_norm.weight.shape)
+        k = self.k_norm.forward_native(k).reshape(k_shape)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -856,6 +852,9 @@ class Plamo2ForCausalLM(PlamoPreTrainedModel, HasInnerState, SupportsPP,
                 ".mixer": "",
                 # Rename the final layernorm of the model.
                 "model.norm.weight": "model.final_layernorm.weight",
+                # Rename the RMSNorm layers' weights.
+                ".q_weight": ".q_norm.weight",
+                ".k_weight": ".k_norm.weight",
 
                 # Rename each mamba layer's components.
                 ".A_log": ".mamba.A",
@@ -867,7 +866,7 @@ class Plamo2ForCausalLM(PlamoPreTrainedModel, HasInnerState, SupportsPP,
                 ".in_proj.weight": ".mamba.in_proj.weight",
                 ".out_proj.weight": ".mamba.out_proj.weight",
                 ".D": ".mamba.D",
-                ".dt_bias": ".mamba.dt_bias",
+                ".dt_bias": ".mamba.dt_proj.bias",
                 ".dt_proj.weight": ".mamba.dt_proj.weight",
             }
             # Apply replacements based on the defined mappings
