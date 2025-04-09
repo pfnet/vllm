@@ -462,7 +462,7 @@ See [this page](#generative-models) for more information on how to use generativ
   * PLaMo2
   * `pfnet/plamo-2-1b`, `pfnet/plamo-2-8b`, etc.
   *
-  *
+  * ✅︎
 - * `QWenLMHeadModel`
   * Qwen
   * `Qwen/Qwen-7B`, `Qwen/Qwen-7B-Chat`, etc.
