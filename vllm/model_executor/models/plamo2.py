@@ -99,20 +99,6 @@ def is_mamba(config: Plamo2Config, i: int) -> bool:
     return (i % config.mamba_step) != (config.mamba_step // 2)
 
 
-# TODO(Shinichi): Replace this with RMSNorm.
-def _rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor,
-              eps: float) -> torch.Tensor:
-    input_shape = hidden_states.shape
-    hidden_states = hidden_states.reshape(input_shape[:-1] + weight.shape)
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + eps)
-    hidden_states = hidden_states.to(input_dtype)
-    hidden_states = weight * hidden_states
-    return hidden_states.reshape(input_shape)
-
-
 def _swiglu(h: torch.Tensor) -> torch.Tensor:
     h0, h1 = h.chunk(2, dim=-1)
     return torch.nn.functional.silu(h0) * h1
@@ -136,6 +122,8 @@ class Plamo2MambaMixer(nn.Module):
         self.conv_kernel_size = config.mamba_d_conv
         self.intermediate_size = (config.mamba_num_heads *
                                   config.hidden_size_per_head)
+        tp_size = get_tensor_model_parallel_world_size()
+        self.intermediate_size_per_tp_worker = self.intermediate_size // tp_size
         self.hidden_size_per_head = config.hidden_size_per_head
         self.num_heads = config.mamba_num_heads
         self.time_step_rank = max(64, self.hidden_size // 16)
@@ -168,22 +156,18 @@ class Plamo2MambaMixer(nn.Module):
         # time step projection (discretization) -
         # In the forward we need to apply dt_proj without the bias,
         # as the bias is added in the selective scan kernel.
-        self.dt_proj = ColumnParallelLinear(
-            self.time_step_rank,
-            self.num_heads,
-            bias=False,
-            prefix=f"{prefix}.dt_proj",
-        )
-        self.dt_bias = torch.nn.Parameter(get_initial_dt_bias(self.num_heads))
+        self.dt_proj = ColumnParallelLinear(self.time_step_rank,
+                                            self.num_heads,
+                                            bias=True,
+                                            skip_bias_add=True)
 
-        tp_size = get_tensor_model_parallel_world_size()
         self.A = nn.Parameter(
             torch.empty(
-                self.intermediate_size // tp_size,
+                self.intermediate_size_per_tp_worker,
                 self.ssm_state_size,
                 dtype=torch.float32,
             ))
-        self.D = nn.Parameter(torch.ones(self.intermediate_size // tp_size))
+        self.D = nn.Parameter(torch.ones(self.intermediate_size_per_tp_worker))
 
         set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
         a_weight_loader = composed_weight_loader(
@@ -215,15 +199,7 @@ class Plamo2MambaMixer(nn.Module):
 
         # 1. Gated MLP's linear projection
         projected_states = self.in_proj(hidden_states)[0]
-        # Reshaping the projected states as in modeling_plamo.py.
-        length = len(hidden_states)
-        projected_states = projected_states.reshape(length, self.num_heads, -1)
-        gate, hidden_states = torch.split(
-            projected_states,
-            [self.hidden_size_per_head, self.hidden_size_per_head],
-            dim=-1)
-        hidden_states = hidden_states.reshape(length, -1).transpose(0, 1)
-        gate = gate.reshape(length, -1).transpose(0, 1)
+        gate, hidden_states = projected_states.transpose(0, 1).chunk(2, dim=-2)
 
         # 2. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
@@ -272,18 +248,18 @@ class Plamo2MambaMixer(nn.Module):
 
         discrete_time_step = self.dt_proj(time_step)[0].transpose(-2, -1)
         # 3.c perform the recurrence y ← SSM(A, B, C)(x)
-        time_proj_bias = (self.dt_bias.float() if hasattr(
+        time_proj_bias = (self.dt_proj.bias.float() if hasattr(
             self.dt_proj, "bias") else None)
 
         # Broadcasting as in modeling_plamo.py.
         discrete_time_step = discrete_time_step.transpose(
             0, 1)[..., None].expand(-1, -1, self.hidden_size_per_head)
         discrete_time_step = discrete_time_step.reshape(
-            -1, self.intermediate_size).transpose(0, 1)
+            -1, self.intermediate_size_per_tp_worker).transpose(0, 1)
         time_proj_bias = time_proj_bias[...,
                                         None].expand(-1,
                                                      self.hidden_size_per_head)
-        time_proj_bias = time_proj_bias.reshape(self.intermediate_size)
+        time_proj_bias = time_proj_bias.reshape(-1)
 
         if attn_metadata.query_start_loc is not None \
             and attn_metadata.context_lens_tensor is not None:
@@ -407,10 +383,18 @@ class Plamo2AttentionMixer(nn.Module):
             base=self.rope_theta,
             rope_scaling=self.rope_scaling,
         )
-        self.q_weight = torch.nn.Parameter(
+        self.q_norm = RMSNorm(config.hidden_size_per_head,
+                              eps=config.rms_norm_eps)
+        self.q_norm.weight = torch.nn.Parameter(
             torch.ones((self.num_heads, config.hidden_size_per_head)))
-        self.k_weight = torch.nn.Parameter(
+        set_weight_attrs(self.q_norm.weight,
+                         {"weight_loader": sharded_weight_loader(0)})
+        self.k_norm = RMSNorm(config.hidden_size_per_head,
+                              eps=config.rms_norm_eps)
+        self.k_norm.weight = torch.nn.Parameter(
             torch.ones((self.num_kv_heads, config.hidden_size_per_head)))
+        set_weight_attrs(self.k_norm.weight,
+                         {"weight_loader": sharded_weight_loader(0)})
 
         self.attn = Attention(
             self.num_heads,
@@ -430,8 +414,14 @@ class Plamo2AttentionMixer(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = _rms_norm(q, self.q_weight, 1e-6)
-        k = _rms_norm(k, self.k_weight, 1e-6)
+
+        q_shape = q.shape
+        q = q.reshape(q_shape[:-1] + self.q_norm.weight.shape)
+        q = self.q_norm.forward_native(q).reshape(q_shape)
+        k_shape = k.shape
+        k = k.reshape(k_shape[:-1] + self.k_norm.weight.shape)
+        k = self.k_norm.forward_native(k).reshape(k_shape)
+
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -740,6 +730,9 @@ class Plamo2ForCausalLM(Plamo2PreTrainedModel, HasInnerState, SupportsPP,
                 ".B_norm_weight": ".B_norm.weight",
                 ".C_norm_weight": ".C_norm.weight",
                 ".dt_norm_weight": ".dt_norm.weight",
+                ".q_weight": ".q_norm.weight",
+                ".k_weight": ".k_norm.weight",
+                ".dt_bias": ".dt_proj.bias",
             }
             # Apply replacements based on the defined mappings
             for old, new in replacements.items():
@@ -757,6 +750,19 @@ class Plamo2ForCausalLM(Plamo2PreTrainedModel, HasInnerState, SupportsPP,
                 loaded_weight = loaded_weight[:, None].expand(
                     -1, self.config.hidden_size_per_head)
                 loaded_weight = loaded_weight.reshape(-1)
+            # Reorder the loaded weight to match the vLLM's linear layer.
+            elif ".mixer.in_proj.weight" in name:
+                # Rearranging mamba's in_proj weights to fit vLLM's expectation.
+                loaded_weight = loaded_weight.transpose(0, 1).reshape(
+                    self.config.hidden_size, self.config.mamba_num_heads, -1)
+                gate_weight, hidden_states_weight = loaded_weight.chunk(2,
+                                                                        dim=-1)
+                gate_weight = gate_weight.reshape(self.config.hidden_size, -1)
+                hidden_states_weight = hidden_states_weight.reshape(
+                    self.config.hidden_size, -1)
+                loaded_weight = torch.cat([gate_weight, hidden_states_weight],
+                                          dim=-1).transpose(0, 1)
+
             # Offset parameter with vllm's RMSNorm haven't been supported yet.
             if ".pre_mixer_norm" in name:
                 loaded_weight += 1.0
