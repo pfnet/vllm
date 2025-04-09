@@ -9,6 +9,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.attention.layer import Attention
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
@@ -327,16 +328,19 @@ class DenseMLP(nn.Module):
         return output  # type: ignore
 
 
+@support_torch_compile
 class Plamo2AttentionMixer(nn.Module):
 
     def __init__(self,
-                 config: Plamo2Config,
-                 cache_config: CacheConfig,
-                 quant_config: QuantizationConfig,
-                 max_model_len: int | None = None,
+                 *,
+                 vllm_config: Optional[VllmConfig] = None,
                  prefix: str = "",
                  **kwargs) -> None:
         super().__init__()
+        config = vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
+        max_model_len = vllm_config.scheduler_config.max_model_len
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
@@ -450,10 +454,7 @@ class Plamo2DecoderLayer(nn.Module):
                                           max_model_len=max_model_len,
                                           prefix=f"{prefix}.mixer")
         else:
-            self.mixer = Plamo2AttentionMixer(config=config,
-                                              cache_config=cache_config,
-                                              quant_config=quant_config,
-                                              max_model_len=max_model_len,
+            self.mixer = Plamo2AttentionMixer(vllm_config=vllm_config,
                                               prefix=f"{prefix}.mixer")
 
         self.mlp = DenseMLP(config=config,
