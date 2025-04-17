@@ -419,7 +419,6 @@ class Plamo2AttentionMixer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
@@ -489,7 +488,6 @@ class Plamo2DecoderLayer(nn.Module):
 
         hidden_states = self.mixer(positions=positions,
                                    hidden_states=hidden_states,
-                                   residual=residual,
                                    mamba_cache_params=mamba_cache_params)
         hidden_states = self.post_mixer_norm(hidden_states)
         # Fully Connected
