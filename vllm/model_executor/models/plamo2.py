@@ -12,6 +12,7 @@ from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
@@ -108,11 +109,6 @@ def _rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor,
     hidden_states = hidden_states.to(input_dtype)
     hidden_states = weight * hidden_states
     return hidden_states.reshape(input_shape)
-
-
-def _swiglu(h: torch.Tensor) -> torch.Tensor:
-    h0, h1 = h.chunk(2, dim=-1)
-    return torch.nn.functional.silu(h0) * h1
 
 
 # Adapted from transformers.models.mamba.modeling_mamba.MambaMixer
@@ -335,6 +331,7 @@ class DenseMLP(nn.Module):
             bias=False,
             prefix=f"{prefix}.gate_up_proj",
             quant_config=quant_config)
+        self.act = SiluAndMul()
         self.down_proj = RowParallelLinear(self.intermediate_size,
                                            self.hidden_size,
                                            bias=False,
@@ -343,7 +340,7 @@ class DenseMLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         h = self.gate_up_proj(hidden_states)[0]
-        h = _swiglu(h)
+        h = self.act(h)
         output, _ = self.down_proj(h)
         return output  # type: ignore
 
