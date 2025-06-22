@@ -97,6 +97,14 @@ vLLM supports the `tool_choice='required'` option in the chat completion API. Si
 
 When tool_choice='required' is set, the model is guaranteed to generate one or more tool calls based on the specified tool list in the `tools` parameter. The number of tool calls depends on the user's query. The output format strictly follows the schema defined in the `tools` parameter.
 
+## None Function Calling
+
+vLLM supports the `tool_choice='none'` option in the chat completion API. When this option is set, the model will not generate any tool calls and will respond with regular text content only, even if tools are defined in the request.
+
+By default, when `tool_choice='none'` is specified, vLLM excludes tool definitions from the prompt to optimize context usage. To include tool definitions even with `tool_choice='none'`, use the `--expand-tools-even-if-tool-choice-none` option.
+
+Note: This behavior will change in v0.10.0, where tool definitions will be included by default even with `tool_choice='none'`.
+
 ## Automatic Function Calling
 
 To enable this feature, you should set the following flags:
@@ -225,6 +233,25 @@ AI21's Jamba-1.5 models are supported.
 * `ai21labs/AI21-Jamba-1.5-Large`
 
 Flags: `--tool-call-parser jamba`
+
+### xLAM Models (`xlam`)
+
+The xLAM tool parser is designed to support models that generate tool calls in various JSON formats. It detects function calls in several different output styles:
+
+1. Direct JSON arrays: Output strings that are JSON arrays starting with `[` and ending with `]`
+2. Thinking tags: Using `<think>...</think>` tags containing JSON arrays
+3. Code blocks: JSON in code blocks (```json ...```)
+4. Tool calls tags: Using `[TOOL_CALLS]` or `<tool_call>...</tool_call>` tags
+
+Parallel function calls are supported, and the parser can effectively separate text content from tool calls.
+
+Supported models:
+* Salesforce Llama-xLAM models: `Salesforce/Llama-xLAM-2-8B-fc-r`, `Salesforce/Llama-xLAM-2-70B-fc-r`
+* Qwen-xLAM models: `Salesforce/xLAM-1B-fc-r`, `Salesforce/xLAM-3B-fc-r`, `Salesforce/Qwen-xLAM-32B-fc-r`
+
+Flags:
+* For Llama-based xLAM models: `--tool-call-parser xlam --chat-template examples/tool_chat_template_xlam_llama.jinja`
+* For Qwen-based xLAM models: `--tool-call-parser xlam --chat-template examples/tool_chat_template_xlam_qwen.jinja`
 
 ### Qwen Models
 
