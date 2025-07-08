@@ -8,10 +8,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 
+from vllm import envs
 from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import get_forward_context
@@ -24,6 +25,7 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba2_metadata import (
     Mamba2Metadata, prepare_mamba2_metadata)
+from vllm.model_executor.layers.mamba.mamba_mixer2 import Mamba2Layer
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
@@ -38,7 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     composed_weight_loader, default_weight_loader, sharded_weight_loader)
 from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid,
-                                                   SupportsPP, SupportsV0Only)
+                                                   SupportsPP)
 from vllm.model_executor.models.mamba_cache import (MambaCacheManager,
                                                     MambaCacheParams)
 from vllm.model_executor.models.utils import (
@@ -48,6 +50,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 from vllm.utils import LayerBlockType
+from vllm.v1.attention.backends.mamba_attn import Mamba2AttentionMetadata
 
 
 # Only used for type hinting.
@@ -98,7 +101,7 @@ def is_mamba(config: Plamo2Config, i: int) -> bool:
 # Adapted from:
 # vllm.model_executor.layers.mamba.mamba_mixer2.MambaMixer2
 # transformers.models.mamba.modeling_mamba.MambaMixer
-class Plamo2MambaMixer(nn.Module):
+class Plamo2MambaMixer(nn.Module, Mamba2Layer):
 
     def __init__(self,
                  vllm_config: VllmConfig,
@@ -196,6 +199,22 @@ class Plamo2MambaMixer(nn.Module):
         self.C_norm = RMSNorm(self.ssm_state_size,
                               eps=self.config.rms_norm_eps)
 
+        self.chunk_size = self.config.mamba_chunk_size
+
+        if envs.VLLM_USE_V1:
+            compilation_config = get_current_vllm_config().compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
+            # The outer list is for v0 PP virtual engine. Though this code path
+            # only runs for v1, we have to do this to unify with the interface
+            # of Attention + v0 PP.
+            # The inner tuple is (conv_state, ssm_state)
+            self.kv_cache = [(torch.tensor([]), torch.tensor([]))]
+            assert self.chunk_size != -1, "chunk_size must be set for v1"
+
+        self.prefix = prefix
+
     def _project_ssm_parameters(self, hidden_states):
         ssm_parameters = self.bcdt_proj(hidden_states)
         B, C, time_step = torch.split(
@@ -219,17 +238,37 @@ class Plamo2MambaMixer(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
 
+        forward_context = get_forward_context()
         # mamba2_metadata contains metadata necessary for the mamba2 triton
         # kernels to operate in continuous batching and in chunked prefill
         # modes; they are computed at top-level model forward since they
         # stay the same and reused for all mamba layers in the same iteration
-        attn_metadata: AttentionMetadata = get_forward_context().attn_metadata
-
-        num_prefills = attn_metadata.num_prefills  # request count
-        num_decodes = attn_metadata.num_decode_tokens  # token count (=request)
-        num_prefill_tokens = attn_metadata.num_prefill_tokens  # token count
-        has_prefill = num_prefills > 0
-        has_decode = num_decodes > 0
+        attn_metadata: AttentionMetadata = forward_context.attn_metadata
+        if envs.VLLM_USE_V1:
+            if attn_metadata is not None:
+                assert isinstance(attn_metadata, dict)
+                attn_metadata = attn_metadata[self.prefix]
+                assert isinstance(attn_metadata, Mamba2AttentionMetadata)
+                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                conv_state = self_kv_cache[0]
+                ssm_state = self_kv_cache[1]
+                state_indices_tensor = attn_metadata.state_indices_tensor
+                has_initial_states_p = attn_metadata.has_initial_states
+                prep_initial_states = attn_metadata.prep_initial_states
+                chunk_size = attn_metadata.chunk_size
+                seq_idx_p = attn_metadata.seq_idx
+                chunk_indices_p = attn_metadata.chunk_indices
+                chunk_offsets_p = attn_metadata.chunk_offsets
+        else:
+            conv_state = mamba_cache_params.conv_state
+            ssm_state = mamba_cache_params.ssm_state
+            state_indices_tensor = mamba_cache_params.state_indices_tensor
+            has_initial_states_p = mamba2_metadata.has_initial_states
+            prep_initial_states = mamba2_metadata.prep_initial_states
+            chunk_size = mamba2_metadata.chunk_size
+            seq_idx_p = mamba2_metadata.seq_idx
+            chunk_indices_p = mamba2_metadata.chunk_indices
+            chunk_offsets_p = mamba2_metadata.chunk_offsets
 
         # 1. Gated MLP's linear projection
         projected_states = self.in_proj(hidden_states)
@@ -239,23 +278,58 @@ class Plamo2MambaMixer(nn.Module):
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0),
                                                self.conv1d.weight.size(2))
 
+        if envs.VLLM_USE_V1 and attn_metadata is None:
+            # V1 profile run
+            hidden_states = (hidden_states.transpose(0, 1).clone().transpose(
+                0, 1)).contiguous()
+            out = self.out_proj(hidden_states)
+            return out
+
+        num_prefills = attn_metadata.num_prefills  # request count
+        num_decodes = attn_metadata.num_decode_tokens  # token count (=request)
+        num_prefill_tokens = attn_metadata.num_prefill_tokens  # token count
+        has_prefill = num_prefills > 0
+        has_decode = num_decodes > 0
+
+        # NOTE: V0 put prefill before decode, v1 puts decode before prefill
         # Separate prefill and decode by splitting varlen input
         # Split along token dimension
-        hidden_states_p, hidden_states_d = torch.split(
-            hidden_states,
-            [num_prefill_tokens, num_decodes],
-            dim=0,
-        )
-        gate_p, gate_d = torch.split(gate, [num_prefill_tokens, num_decodes],
-                                     dim=0)
-        # Split along batch dimension
-        state_indices_tensor_p, state_indices_tensor_d = torch.split(
-            mamba_cache_params.state_indices_tensor,
-            [num_prefills, num_decodes],
-            dim=0,
-        )
-        query_start_loc_p = (attn_metadata.query_start_loc[:num_prefills + 1]
-                             if has_prefill else None)
+        if envs.VLLM_USE_V1:
+            hidden_states_d, hidden_states_p = torch.split(
+                hidden_states,
+                [num_decodes, num_prefill_tokens],
+                dim=0,
+            )
+            gate_d, gate_p = torch.split(gate,
+                                         [num_decodes, num_prefill_tokens],
+                                         dim=0)
+            # Split along batch dimension
+            state_indices_tensor_d, state_indices_tensor_p = torch.split(
+                state_indices_tensor,
+                [num_decodes, num_prefills],
+                dim=0,
+            )
+            query_start_loc_p = (
+                attn_metadata.query_start_loc[-num_prefills - 1:] -
+                num_decodes if has_prefill else None)
+        else:
+            hidden_states_p, hidden_states_d = torch.split(
+                hidden_states,
+                [num_prefill_tokens, num_decodes],
+                dim=0,
+            )
+            gate_p, gate_d = torch.split(gate,
+                                         [num_prefill_tokens, num_decodes],
+                                         dim=0)
+            # Split along batch dimension
+            state_indices_tensor_p, state_indices_tensor_d = torch.split(
+                state_indices_tensor,
+                [num_prefills, num_decodes],
+                dim=0,
+            )
+            query_start_loc_p = (attn_metadata.query_start_loc[:num_prefills +
+                                                               1]
+                                 if has_prefill else None)
 
         ssd_output_list = []
 
@@ -263,14 +337,14 @@ class Plamo2MambaMixer(nn.Module):
         if has_prefill:
             # 2. Convolution sequence transformation
             # - "cache_indices" updates the conv_state cache in positions
-            # pointed to by "mamba_cache_params.state_indices_tensor"
+            #   pointed to by "state_indices_tensor"
             hidden_states_p = causal_conv1d_fn(
                 hidden_states_p.transpose(0, 1),
                 conv_weights,
                 self.conv1d.bias,
                 activation=self.activation,
-                conv_states=mamba_cache_params.conv_state,
-                has_initial_state=mamba2_metadata.has_initial_states,
+                conv_states=conv_state,
+                has_initial_state=has_initial_states_p,
                 cache_indices=state_indices_tensor_p,
                 query_start_loc=query_start_loc_p)
             hidden_states_p = hidden_states_p.transpose(0, 1)
@@ -284,12 +358,11 @@ class Plamo2MambaMixer(nn.Module):
 
             # 3. State Space Model sequence transformation
             initial_states = None
-            if (mamba2_metadata.has_initial_states is not None
-                    and mamba2_metadata.prep_initial_states):
+            if has_initial_states_p is not None and prep_initial_states:
                 # making a copy of the states
                 initial_states = torch.where(
-                    mamba2_metadata.has_initial_states[:, None, None, None],
-                    mamba_cache_params.ssm_state[state_indices_tensor_p], 0)
+                    has_initial_states_p[:, None, None, None],
+                    ssm_state[state_indices_tensor_p], 0)
             scan_output, varlen_state = mamba_chunk_scan_combined(
                 hidden_states_p.view(1, num_prefill_tokens,
                                      self.num_heads // self.tp_size,
@@ -298,15 +371,15 @@ class Plamo2MambaMixer(nn.Module):
                 self.A,
                 B.view(1, num_prefill_tokens, 1, -1),
                 C.view(1, num_prefill_tokens, 1, -1),
-                chunk_size=mamba2_metadata.chunk_size,
+                chunk_size=chunk_size,
                 D=self.D,
                 z=gate_p.view(1, num_prefill_tokens,
                               self.num_heads // self.tp_size, self.head_dim),
                 dt_bias=self.dt_bias,
-                seq_idx=mamba2_metadata.seq_idx,
-                chunk_indices=mamba2_metadata.chunk_indices,
-                chunk_offsets=mamba2_metadata.chunk_offsets,
-                cu_seqlens=attn_metadata.query_start_loc[:num_prefills + 1],
+                seq_idx=seq_idx_p,
+                chunk_indices=chunk_indices_p,
+                chunk_offsets=chunk_offsets_p,
+                cu_seqlens=query_start_loc_p,
                 initial_states=initial_states,
                 return_varlen_states=True,
                 return_final_states=False,
@@ -316,7 +389,7 @@ class Plamo2MambaMixer(nn.Module):
 
             # update ssm states
             # - varlen state is a (batch, nheads, headdim, dstate) tensor
-            mamba_cache_params.ssm_state[state_indices_tensor_p] = varlen_state
+            ssm_state[state_indices_tensor_p] = varlen_state
 
             # - reshape
             ssd_output_list.append(scan_output.view(num_prefill_tokens, -1))
@@ -326,7 +399,7 @@ class Plamo2MambaMixer(nn.Module):
             # 2. Convolution sequence transformation
             hidden_states_d = causal_conv1d_update(
                 hidden_states_d,
-                mamba_cache_params.conv_state,
+                conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
@@ -351,7 +424,7 @@ class Plamo2MambaMixer(nn.Module):
             #   using state_indices_tensor_d
 
             hidden_states_d = selective_state_update(
-                mamba_cache_params.ssm_state,
+                ssm_state,
                 hidden_states_d,
                 dt,
                 A,
@@ -363,9 +436,15 @@ class Plamo2MambaMixer(nn.Module):
                 dt_softplus=True,
                 state_batch_indices=state_indices_tensor_d,
             )
-            ssd_output_list.append(
-                hidden_states_d.view(-1, (self.num_heads // self.tp_size) *
-                                     self.head_dim))
+            if envs.VLLM_USE_V1:
+                ssd_output_list.insert(
+                    0,
+                    hidden_states_d.view(-1, (self.num_heads // self.tp_size) *
+                                         self.head_dim))
+            else:
+                ssd_output_list.append(
+                    hidden_states_d.view(-1, (self.num_heads // self.tp_size) *
+                                         self.head_dim))
 
         # Merge prefill and decode outputs before passing to MLP
         hidden_states = torch.vstack(ssd_output_list)
@@ -373,6 +452,20 @@ class Plamo2MambaMixer(nn.Module):
         # 4. Final linear projection
         out = self.out_proj(hidden_states)
         return out
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        world_size = get_tensor_model_parallel_world_size()
+        hidden_size = self.num_heads * self.head_dim
+        conv_state_shape = (
+            divide(hidden_size, world_size),
+            self.config.mamba_d_conv - 1,
+        )
+        temporal_state_shape = (
+            divide(self.num_heads, world_size),
+            self.head_dim,
+            self.ssm_state_size,
+        )
+        return conv_state_shape, temporal_state_shape
 
 
 class DenseMLP(nn.Module):
@@ -607,7 +700,7 @@ class Plamo2Decoder(torch.nn.Module):
         mamba_cache_index = 0
         for layer in self.layers[self.start_layer:self.end_layer]:
             layer_mamba_cache_params = None
-            if layer.is_mamba:
+            if layer.is_mamba and mamba_cache_params is not None:
                 layer_mamba_cache_params = mamba_cache_params.at_layer_idx(
                     mamba_cache_index)
                 mamba_cache_index += 1
@@ -669,11 +762,16 @@ class Plamo2Model(Plamo2PreTrainedModel):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        attn_metadata: AttentionMetadata = get_forward_context().attn_metadata
-        mamba2_metadata = prepare_mamba2_metadata(
-            chunk_size=self.config.mamba_chunk_size,
-            attn_metadata=attn_metadata,
-        )
+        if not envs.VLLM_USE_V1:
+            attn_metadata: AttentionMetadata = get_forward_context(
+            ).attn_metadata
+            mamba2_metadata = prepare_mamba2_metadata(
+                chunk_size=self.config.mamba_chunk_size,
+                attn_metadata=attn_metadata,
+            )
+        else:
+            # v1 get mamba2_metadata from forward_context
+            mamba2_metadata = None
 
         hidden_states, residual = self.layers(
             positions=positions,
@@ -692,7 +790,7 @@ class Plamo2Model(Plamo2PreTrainedModel):
 
 
 class Plamo2ForCausalLM(Plamo2PreTrainedModel, HasInnerState, SupportsPP,
-                        IsHybrid, SupportsV0Only):
+                        IsHybrid):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -753,15 +851,21 @@ class Plamo2ForCausalLM(Plamo2PreTrainedModel, HasInnerState, SupportsPP,
                 intermediate_tensors: Optional[IntermediateTensors] = None,
                 inputs_embeds: Optional[torch.Tensor] = None,
                 **kwargs):
-        if self.mamba_cache is None:
-            num_mamba_layers = self.model_config.get_num_layers_by_block_type(
-                self.vllm_config.parallel_config, LayerBlockType.mamba)
+        if not envs.VLLM_USE_V1:
+            if self.mamba_cache is None:
+                num_mamba_layers = (
+                    self.model_config.get_num_layers_by_block_type(
+                        self.vllm_config.parallel_config,
+                        LayerBlockType.mamba))
 
-            self.mamba_cache = MambaCacheManager(
-                self.vllm_config, self.lm_head.weight.dtype, num_mamba_layers,
-                *self._get_mamba_cache_shape())
+                self.mamba_cache = MambaCacheManager(
+                    self.vllm_config, self.lm_head.weight.dtype,
+                    num_mamba_layers, *self._get_mamba_cache_shape())
 
-        mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
+            mamba_cache_params = self.mamba_cache.current_run_tensors(**kwargs)
+        else:
+            # NOTE: mamba_cache_params is not needed for v1
+            mamba_cache_params = None
 
         hidden_states = self.model(input_ids, positions, mamba_cache_params,
                                    intermediate_tensors, inputs_embeds)
