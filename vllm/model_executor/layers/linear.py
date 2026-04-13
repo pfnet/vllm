@@ -916,6 +916,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                             loaded_weight=loaded_weight, shard_id=idx
                         )
                 else:
+                    # When weights are already fused on disk (e.g. Phi-3's
+                    # gate_up_proj), there is only a single scale for the
+                    # entire fused matrix.  Narrow the param (shape [N]) to
+                    # [1] so only slot 0 is written, matching the checkpoint.
+                    param.data = param.data.narrow(0, 0, 1)
                     param.load_merged_column_weight(
                         loaded_weight=loaded_weight, shard_id=0
                     )
@@ -1130,6 +1135,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.validate_shard_id(loaded_shard_id)
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
+                # When weights are already fused on disk (e.g. Phi-3's
+                # qkv_proj), there is only a single scale for the entire
+                # fused matrix.  Narrow the param (shape [3]) to [1] so
+                # only slot 0 is written, matching the checkpoint.
+                param.data = param.data.narrow(0, 0, 1)
                 param.load_qkv_weight(
                     loaded_weight=loaded_weight, shard_id=0, tp_rank=self.tp_rank
                 )
