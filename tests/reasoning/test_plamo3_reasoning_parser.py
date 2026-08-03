@@ -661,3 +661,83 @@ def test_init_rejects_empty_think_tag_tokenization():
 
     with pytest.raises(ValueError, match="failed to tokenize think tags"):
         PlamoReasoningParser(EmptyThinkTagTokenizer())
+
+
+def _parser_with_reasoning_enabled(tokenizer):
+    return PlamoReasoningParser(
+        tokenizer, chat_template_kwargs={"enable_reasoning": True}
+    )
+
+
+def test_non_streaming_enable_reasoning_no_begin_tag(tokenizer):
+    parser = _parser_with_reasoning_enabled(tokenizer)
+    reasoning_text = "プランを検討中…"
+    content_text = "最終回答です。"
+    model_output = f"{reasoning_text}{END_THINK_TAG}{content_text}"
+
+    reasoning, content = parser.extract_reasoning(model_output, request=None)  # type: ignore[arg-type]
+    assert reasoning == reasoning_text
+    assert content == content_text
+
+
+def test_non_streaming_enable_reasoning_no_begin_no_end_tag(tokenizer):
+    parser = _parser_with_reasoning_enabled(tokenizer)
+    model_output = "考えだけで終わる"
+    reasoning, content = parser.extract_reasoning(model_output, request=None)  # type: ignore[arg-type]
+    assert reasoning == model_output
+    assert content is None
+
+
+def test_non_streaming_enable_reasoning_begin_tag_still_works(tokenizer):
+    parser = _parser_with_reasoning_enabled(tokenizer)
+    reasoning_text = "プランを検討中…"
+    content_text = "最終回答です。"
+    model_output = f"{BEGIN_THINK_TAG}{reasoning_text}{END_THINK_TAG}{content_text}"
+
+    reasoning, content = parser.extract_reasoning(model_output, request=None)  # type: ignore[arg-type]
+    assert reasoning == reasoning_text
+    assert content == content_text
+
+
+def test_streaming_enable_reasoning_no_begin_tag(tokenizer):
+    parser = _parser_with_reasoning_enabled(tokenizer)
+    deltas = [
+        "考え",
+        "を積み上げ",
+        END_THINK_TAG,
+        "ユーザーへの回答",
+    ]
+    reasoning, content = run_reasoning_extraction(parser, deltas, streaming=True)
+    assert reasoning == "考えを積み上げ"
+    assert content == "ユーザーへの回答"
+
+
+def test_streaming_enable_reasoning_no_begin_no_end_tag(tokenizer):
+    parser = _parser_with_reasoning_enabled(tokenizer)
+    deltas = ["考えだけで終わる"]
+    reasoning, content = run_reasoning_extraction(parser, deltas, streaming=True)
+    assert reasoning == "考えだけで終わる"
+    assert content is None
+
+
+def test_streaming_enable_reasoning_begin_tag_still_works(tokenizer):
+    parser = _parser_with_reasoning_enabled(tokenizer)
+    deltas = [
+        BEGIN_THINK_TAG,
+        "考え",
+        END_THINK_TAG,
+        "ユーザーへの回答",
+    ]
+    reasoning, content = run_reasoning_extraction(parser, deltas, streaming=True)
+    assert reasoning == "考え"
+    assert content == "ユーザーへの回答"
+
+
+def test_enable_thinking_fallback_for_reasoning_enabled(tokenizer):
+    parser = PlamoReasoningParser(
+        tokenizer, chat_template_kwargs={"enable_thinking": True}
+    )
+    model_output = f"reasoning{END_THINK_TAG}content"
+    reasoning, content = parser.extract_reasoning(model_output, request=None)  # type: ignore[arg-type]
+    assert reasoning == "reasoning"
+    assert content == "content"

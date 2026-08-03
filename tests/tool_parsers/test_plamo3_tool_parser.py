@@ -24,8 +24,10 @@ from vllm.utils.plamo3_parser_common import (
     END_TOOL_NAME_TAG,
     END_TOOL_REQUEST_TAG,
     END_TOOL_REQUESTS_TAG,
-    EOT_TAG,
+   EOT_TAG,
 )
+
+PlamoToolParser = ToolParserManager.get_tool_parser("plamo3")
 
 
 class _DummyTokenizer:

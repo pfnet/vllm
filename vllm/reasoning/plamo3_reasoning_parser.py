@@ -45,6 +45,16 @@ class Plamo3ReasoningParser(ReasoningParser):
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
 
+        # The chat template may or may not include the begin-think tag in the
+        # generation prompt. When reasoning is enabled explicitly via
+        # chat_template_kwargs, the parser should assume a reasoning block is
+        # present even if the model does not emit the begin tag itself.
+        chat_template_kwargs = kwargs.get("chat_template_kwargs") or {}
+        enable_reasoning = chat_template_kwargs.get("enable_reasoning")
+        if enable_reasoning is None:
+            enable_reasoning = chat_template_kwargs.get("enable_thinking", False)
+        self._enable_reasoning: bool = bool(enable_reasoning)
+
         self._begin_think_token_ids: list[int] = list(
             tokenizer.encode(BEGIN_THINK_TAG, add_special_tokens=False)
         )
@@ -175,6 +185,12 @@ class Plamo3ReasoningParser(ReasoningParser):
                         " waiting for completion"
                     )
                     break
+                if self._enable_reasoning:
+                    # The generation prompt already included the begin-think
+                    # tag, so the model output starts directly with reasoning.
+                    # Stay in the reasoning phase until END_THINK_TAG appears.
+                    self._stream_phase = ReasoningParserStreamPhase.IN_REASONING
+                    continue
                 # If the head is neither the tag nor its prefix fragment,
                 # treat everything as content
                 self._stream_phase = ReasoningParserStreamPhase.AFTER_REASONING
@@ -249,7 +265,13 @@ class Plamo3ReasoningParser(ReasoningParser):
         tuple[Optional[str], Optional[str]]
             A tuple containing the reasoning content and the content.
         """
-        if not model_output.startswith(BEGIN_THINK_TAG):
+        if model_output.startswith(BEGIN_THINK_TAG):
+            begin_tag_end = len(BEGIN_THINK_TAG)
+        elif self._enable_reasoning:
+            # The generation prompt included the begin-think tag, so the model
+            # output starts with reasoning directly.
+            begin_tag_end = 0
+        else:
             # A lone partial begin-think anchor ("<|plamo:begin_") left by a
             # max_tokens cut lands here (it is not the full tag). Strip the
             # incomplete-marker artifact so it does not leak as content; real
@@ -257,7 +279,6 @@ class Plamo3ReasoningParser(ReasoningParser):
             # original empty-handling (return the string, not None) so this path
             # only loses the marker artifact, nothing else.
             return None, strip_trailing_partial_marker(model_output)
-        begin_tag_end = len(BEGIN_THINK_TAG)
         end_tag_start = model_output.find(END_THINK_TAG, begin_tag_end)
         if end_tag_start == -1:
             # END_THINK not found: the turn was cut inside the reasoning span.
