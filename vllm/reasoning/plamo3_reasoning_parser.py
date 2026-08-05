@@ -45,15 +45,11 @@ class Plamo3ReasoningParser(ReasoningParser):
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
 
-        # The chat template may or may not include the begin-think tag in the
-        # generation prompt. When reasoning is enabled explicitly via
-        # chat_template_kwargs, the parser should assume a reasoning block is
-        # present even if the model does not emit the begin tag itself.
+        # When enable_thinking is specified in the chat template, this parser starts
+        # in the reasoning phase and does not require the model to emit the begin tag
+        # to handle the case where the chat template injects the begin tag.
         chat_template_kwargs = kwargs.get("chat_template_kwargs") or {}
-        enable_reasoning = chat_template_kwargs.get("enable_reasoning")
-        if enable_reasoning is None:
-            enable_reasoning = chat_template_kwargs.get("enable_thinking", False)
-        self._enable_reasoning: bool = bool(enable_reasoning)
+        self._enable_reasoning = chat_template_kwargs.get("enable_thinking", False)
 
         self._begin_think_token_ids: list[int] = list(
             tokenizer.encode(BEGIN_THINK_TAG, add_special_tokens=False)
@@ -186,9 +182,6 @@ class Plamo3ReasoningParser(ReasoningParser):
                     )
                     break
                 if self._enable_reasoning:
-                    # The generation prompt already included the begin-think
-                    # tag, so the model output starts directly with reasoning.
-                    # Stay in the reasoning phase until END_THINK_TAG appears.
                     self._stream_phase = ReasoningParserStreamPhase.IN_REASONING
                     continue
                 # If the head is neither the tag nor its prefix fragment,
@@ -268,8 +261,6 @@ class Plamo3ReasoningParser(ReasoningParser):
         if model_output.startswith(BEGIN_THINK_TAG):
             begin_tag_end = len(BEGIN_THINK_TAG)
         elif self._enable_reasoning:
-            # The generation prompt included the begin-think tag, so the model
-            # output starts with reasoning directly.
             begin_tag_end = 0
         else:
             # A lone partial begin-think anchor ("<|plamo:begin_") left by a
