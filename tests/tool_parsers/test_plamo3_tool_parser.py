@@ -13,7 +13,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     ToolCall,
 )
 from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
-from vllm.utils.plamo3_parser_common import (
+from vllm.tool_parsers.plamo3_tool_parser import (
     BEGIN_THINK_TAG,
     BEGIN_TOOL_ARGS_TAG,
     BEGIN_TOOL_NAME_TAG,

@@ -5,7 +5,7 @@ import pytest
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.reasoning import ReasoningParser, ReasoningParserManager
-from vllm.utils.plamo3_parser_common import BEGIN_THINK_TAG, END_THINK_TAG
+from vllm.reasoning.plamo3_reasoning_parser import BEGIN_THINK_TAG, END_THINK_TAG
 
 
 class _DummyTokenizer:
