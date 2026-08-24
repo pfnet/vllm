@@ -10,12 +10,14 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from vllm import envs, ir
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -30,11 +32,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    LoaderFunction,
-    composed_weight_loader,
-    default_weight_loader,
-)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -71,11 +69,63 @@ if TYPE_CHECKING:
         vocab_size: int
 
 
-def rms_norm_weight_loader(offset: float) -> LoaderFunction:
-    return composed_weight_loader(
-        default_weight_loader,
-        lambda x: x + offset,
-    )
+class Plamo3RMSNorm(RMSNorm):
+    """RMSNorm with an offset applied without modifying the loaded weight."""
+
+    def __init__(self, hidden_size: int, eps: float, offset: float) -> None:
+        super().__init__(hidden_size, eps=eps)
+        self.offset = offset
+        nn.init.zeros_(self.weight)
+        self.register_buffer(
+            "weight_with_offset",
+            torch.full_like(self.weight, offset),
+            persistent=False,
+        )
+        set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
+
+    def update_weight_with_offset(self) -> None:
+        self.weight_with_offset.copy_(self.weight.data + self.offset)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        default_weight_loader(param, loaded_weight)
+        self.update_weight_with_offset()
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return ir.ops.rms_norm(
+                x,
+                self.weight_with_offset,
+                self.variance_epsilon,
+                self.variance_size_override,
+            )
+        return ir.ops.fused_add_rms_norm.maybe_inplace(
+            x,
+            residual,
+            self.weight_with_offset,
+            self.variance_epsilon,
+            self.variance_size_override,
+        )
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if envs.VLLM_BATCH_INVARIANT:
+            assert self.variance_size_override is None, (
+                "Batch invariance is not supported for variance_size_override"
+            )
+            return rms_norm_batch_invariant(
+                x,
+                self.weight_with_offset,
+                self.variance_epsilon,
+                residual=residual,
+            )
+        return self.forward_native(x, residual)
 
 
 class DenseMLP(nn.Module):
@@ -183,14 +233,8 @@ class Plamo3AttentionMixer(nn.Module):
             max_position=max_position,
             rope_parameters=rope_parameters,
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        set_weight_attrs(
-            self.q_norm.weight, {"weight_loader": rms_norm_weight_loader(offset=1.0)}
-        )
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        set_weight_attrs(
-            self.k_norm.weight, {"weight_loader": rms_norm_weight_loader(offset=1.0)}
-        )
+        self.q_norm = Plamo3RMSNorm(self.head_dim, eps=config.rms_norm_eps, offset=1.0)
+        self.k_norm = Plamo3RMSNorm(self.head_dim, eps=config.rms_norm_eps, offset=1.0)
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -240,25 +284,19 @@ class Plamo3DecoderLayer(nn.Module):
         self.mlp = DenseMLP(
             config=config, quant_config=quant_config, prefix=f"{prefix}.mlp"
         )
-        self.pre_mixer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        set_weight_attrs(
-            self.pre_mixer_norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0)},
+        self.pre_mixer_norm = Plamo3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, offset=1.0
         )
-        self.post_mixer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        set_weight_attrs(
-            self.post_mixer_norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0 / 5)},
+        self.post_mixer_norm = Plamo3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, offset=1.0 / 5
         )
-        self.pre_mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        set_weight_attrs(
-            self.pre_mlp_norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0)},
+        self.pre_mlp_norm = Plamo3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, offset=1.0
         )
-        self.post_mlp_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        set_weight_attrs(
-            self.post_mlp_norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0 / (5**1.5))},
+        self.post_mlp_norm = Plamo3RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            offset=1.0 / (5**1.5),
         )
 
     def forward(
@@ -331,10 +369,8 @@ class Plamo3Model(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
         self.layers = Plamo3Decoder(vllm_config, prefix=f"{prefix}.layers")
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        set_weight_attrs(
-            self.norm.weight,
-            {"weight_loader": rms_norm_weight_loader(offset=1.0)},
+        self.norm = Plamo3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, offset=1.0
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -432,3 +468,8 @@ class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def process_weights_after_loading(self) -> None:
+        for module in self.modules():
+            if isinstance(module, Plamo3RMSNorm):
+                module.update_weight_with_offset()
