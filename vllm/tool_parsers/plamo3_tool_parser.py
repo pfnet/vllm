@@ -36,11 +36,8 @@ logger = init_logger(__name__)
 
 
 def parse_model_output(model_output: str) -> tuple[str, list[ToolCall]]:
-    """Parse a complete model output into content and tool calls.
+    model_output = model_output.split(EOT_TAG, maxsplit=1)[0]
 
-    Returns ``(content, tool_calls)`` where ``content`` is the text before the
-    first tool-requests tag.
-    """
     if (pos_begin_requests := model_output.find(BEGIN_TOOL_REQUESTS_TAG)) == -1:
         return model_output, []
 
