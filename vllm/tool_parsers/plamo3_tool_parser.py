@@ -27,6 +27,7 @@ from vllm.reasoning.plamo3_reasoning_parser import (
     END_TOOL_REQUESTS_TAG,
     EOT_TAG,
     compute_safe_until,
+    strip_at_eot,
     strip_trailing_partial_marker,
 )
 from vllm.tokenizers import TokenizerLike
@@ -36,7 +37,7 @@ logger = init_logger(__name__)
 
 
 def parse_model_output(model_output: str) -> tuple[str, list[ToolCall]]:
-    model_output = model_output.split(EOT_TAG, maxsplit=1)[0]
+    model_output = strip_at_eot(model_output)
 
     if (pos_begin_requests := model_output.find(BEGIN_TOOL_REQUESTS_TAG)) == -1:
         return model_output, []

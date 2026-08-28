@@ -101,6 +101,10 @@ def strip_trailing_partial_marker(text: str) -> str:
     return text
 
 
+def strip_at_eot(text: str) -> str:
+    return text.split(EOT_TAG, maxsplit=1)[0]
+
+
 def compute_safe_until(buf: str, floor: int, tags: list[tuple[str, str]]) -> int:
     """Compute the largest buffer position that can be safely flushed.
 
@@ -186,6 +190,7 @@ class ReasoningParserStreamPhase(Enum):
     BEFORE_REASONING = "before_reasoning"
     IN_REASONING = "in_reasoning"
     AFTER_REASONING = "after_reasoning"
+    DONE = "done"
 
 
 class Plamo3ReasoningParser(ReasoningParser):
@@ -227,6 +232,7 @@ class Plamo3ReasoningParser(ReasoningParser):
             ReasoningParserStreamPhase.BEFORE_REASONING
         )
         self._stream_emit_pos: int = 0
+        self._identity_stream_terminated: bool = False
         # Some vLLM call paths pass only delta token IDs, which is too short to
         # detect the multi-token END_THINK sequence. Keep the full stream token
         # IDs updated in extract_reasoning_streaming and fall back to them
@@ -329,6 +335,11 @@ class Plamo3ReasoningParser(ReasoningParser):
         """
 
         if self._identity_parser is not None:
+            if self._identity_stream_terminated:
+                return None
+            if EOT_TAG in delta_text:
+                self._identity_stream_terminated = True
+                delta_text = strip_at_eot(delta_text)
             return self._identity_parser.extract_reasoning_streaming(
                 previous_text,
                 current_text,
@@ -369,48 +380,65 @@ class Plamo3ReasoningParser(ReasoningParser):
                 continue
 
             if self._stream_phase == ReasoningParserStreamPhase.IN_REASONING:
-                # Search for the end tag after the last emitted position
                 search_offset = self._stream_emit_pos
+                text_end = len(current_text)
                 end_tag_start = current_text.find(END_THINK_TAG, search_offset)
-                if end_tag_start != -1:
-                    end_tag_end = end_tag_start + len(END_THINK_TAG)
-                    reasoning_delta = ""
-                    if end_tag_start > self._stream_emit_pos:
-                        reasoning_delta = current_text[
-                            self._stream_emit_pos : end_tag_start
-                        ]
-                    content_delta = current_text[end_tag_end:]
-                    self._stream_emit_pos = len(current_text)
-                    self._stream_phase = ReasoningParserStreamPhase.AFTER_REASONING
-                    if reasoning_delta or content_delta:
-                        return DeltaMessage(
-                            reasoning=reasoning_delta or None,
-                            content=content_delta or None,
-                        )
-                    return None
-                else:
-                    # End tag not found yet. Emit only the safely determinable range.
-                    # END_THINK_TAG starts with the single-token anchor "<|plamo:end_",
-                    # so we only hold back content when the buffer tail
-                    # matches a prefix of the tag starting at that anchor.
-                    if self._stream_emit_pos < len(current_text):
-                        safe_until = compute_safe_until(
-                            current_text,
-                            self._stream_emit_pos,
-                            [(END_THINK_TAG, "<|plamo:end_")],
-                        )
-                        if safe_until > self._stream_emit_pos:
-                            delta = current_text[self._stream_emit_pos : safe_until]
-                            if delta:
-                                self._stream_emit_pos = safe_until
-                                return DeltaMessage(reasoning=delta)
+                end_tag_start = text_end if end_tag_start == -1 else end_tag_start
+                eot_start = current_text.find(EOT_TAG, search_offset)
+                eot_start = text_end if eot_start == -1 else eot_start
+                # When EOT appears before END_THINK, emit reasoning up to EOT and
+                # transition to DONE. The content after EOT is ignored.
+                if eot_start < end_tag_start:
+                    self._stream_emit_pos = eot_start + len(EOT_TAG)
+                    self._stream_phase = ReasoningParserStreamPhase.DONE
+                    if reasoning_delta := current_text[search_offset:eot_start]:
+                        return DeltaMessage(reasoning=reasoning_delta)
                     break
+                # When both EOT and END_THINK are absent, emit reasoning up to the safe point
+                # and hold back the tail in case it is a partial END_THINK tag.
+                if end_tag_start == text_end:
+                    safe_until = compute_safe_until(
+                        current_text,
+                        search_offset,
+                        [(END_THINK_TAG, "<|plamo:end_")],
+                    )
+                    if safe_until > search_offset:
+                        self._stream_emit_pos = safe_until
+                        return DeltaMessage(
+                            reasoning=current_text[search_offset:safe_until]
+                        )
+                    break
+                # When END_THINK appears before EOT, emit reasoning up to the tag and content after the tag.
+                if eot_start != text_end:
+                    self._stream_emit_pos = eot_start + len(EOT_TAG)
+                    self._stream_phase = ReasoningParserStreamPhase.DONE
+                else:
+                    self._stream_emit_pos = text_end
+                    self._stream_phase = ReasoningParserStreamPhase.AFTER_REASONING
+                end_tag_end = end_tag_start + len(END_THINK_TAG)
+                reasoning_delta = current_text[search_offset:end_tag_start]
+                content_delta = current_text[end_tag_end:eot_start]
+                if reasoning_delta or content_delta:
+                    return DeltaMessage(
+                        reasoning=reasoning_delta or None,
+                        content=content_delta or None,
+                    )
+                break
 
             if self._stream_phase == ReasoningParserStreamPhase.AFTER_REASONING:
-                delta = current_text[self._stream_emit_pos :]
-                if delta:
+                eot_start = current_text.find(EOT_TAG, self._stream_emit_pos)
+                if eot_start != -1:
+                    delta = current_text[self._stream_emit_pos : eot_start]
+                    self._stream_emit_pos = eot_start + len(EOT_TAG)
+                    self._stream_phase = ReasoningParserStreamPhase.DONE
+                else:
+                    delta = current_text[self._stream_emit_pos :]
                     self._stream_emit_pos = len(current_text)
+                if delta:
                     return DeltaMessage(content=delta)
+                break
+
+            if self._stream_phase == ReasoningParserStreamPhase.DONE:
                 break
 
         return None
@@ -421,8 +449,12 @@ class Plamo3ReasoningParser(ReasoningParser):
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
         if self._identity_parser is not None:
-            return self._identity_parser.extract_reasoning(model_output, request)
+            reasoning, content = self._identity_parser.extract_reasoning(
+                model_output, request
+            )
+            return reasoning, strip_at_eot(content) if content is not None else None
 
+        model_output = strip_at_eot(model_output)
         begin_tag_end = (
             len(BEGIN_THINK_TAG) if model_output.startswith(BEGIN_THINK_TAG) else 0
         )
