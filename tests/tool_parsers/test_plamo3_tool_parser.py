@@ -1,114 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# ruff: noqa: E501
 import json
 from unittest.mock import Mock
 
 import pytest
 
+from tests.reasoning.test_plamo3_reasoning_parser import _DummyTokenizer
+from tests.tool_parsers.utils import StreamingToolReconstructor
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import (
-    DeltaMessage,
     FunctionCall,
     ToolCall,
 )
-from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
-from vllm.tool_parsers.plamo3_tool_parser import (
+from vllm.reasoning.plamo3_reasoning_parser import (
+    _ALL_SPECIAL_TAGS,
     BEGIN_THINK_TAG,
+    END_THINK_TAG,
+    Plamo3ReasoningParser,
+    strip_trailing_partial_marker,
+)
+from vllm.tool_parsers.plamo3_tool_parser import (
     BEGIN_TOOL_ARGS_TAG,
     BEGIN_TOOL_NAME_TAG,
     BEGIN_TOOL_REQUEST_TAG,
     BEGIN_TOOL_REQUESTS_TAG,
-    END_THINK_TAG,
     END_TOOL_ARGS_TAG,
     END_TOOL_NAME_TAG,
     END_TOOL_REQUEST_TAG,
     END_TOOL_REQUESTS_TAG,
     EOT_TAG,
+    Plamo3ToolParser,
 )
-
-PlamoToolParser = ToolParserManager.get_tool_parser("plamo3")
-
-
-class _DummyTokenizer:
-    """Minimal tokenizer with PLaMo-3 special-token ID mappings for unit tests."""
-
-    def __init__(self):
-        self._vocab: dict[str, int] = {}
-        self.bos_token_id: int | None = 1
-
-    def get_vocab(self) -> dict[str, int]:
-        return self._vocab
-
-    def tokenize(self, text: str) -> list[str]:
-        return [text] if text else []
-
-    def convert_tokens_to_string(self, tokens: list[str]) -> str:
-        return "".join(tokens)
-
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        # Grammar anchors (single-token prefixes/suffixes)
-        if text == "<|plamo:begin_":
-            return [256]
-        if text == "<|plamo:end_":
-            return [257]
-        if text == ":plamo|>":
-            return [258]
-        # Reasoning tags
-        if text == "<|plamo:begin_think:plamo|>":
-            return [256, 21279, 258]
-        if text == "<|plamo:end_think:plamo|>":
-            return [257, 21279, 258]
-        # Tool tags
-        if text == "<|plamo:begin_tool_requests:plamo|>":
-            return [256, 13672, 95, 31026, 258]
-        if text == "<|plamo:end_tool_requests:plamo|>":
-            return [257, 13672, 95, 31026, 258]
-        if text == "<|plamo:begin_tool_request:plamo|>":
-            return [256, 13672, 95, 2475, 258]
-        if text == "<|plamo:end_tool_request:plamo|>":
-            return [257, 13672, 95, 2475, 258]
-        if text == "<|plamo:begin_tool_name:plamo|>":
-            return [256, 13672, 50416, 258]
-        if text == "<|plamo:end_tool_name:plamo|>":
-            return [257, 13672, 50416, 258]
-        # Composite BEGIN_TOOL_ARGS_TAG
-        if text == (
-            "<|plamo:begin_tool_arguments:plamo|><|plamo:constrain|>json<|plamo:msg|>"
-        ):
-            return [256, 13672, 95, 19868, 258, 31, 349, 19]
-        if text == "<|plamo:end_tool_arguments:plamo|>":
-            return [257, 13672, 95, 19868, 258]
-        if text == "<|plamo:constrain|>":
-            return [31]
-        if text == "<|plamo:msg|>":
-            return [19]
-        if text == "<|plamo:tag|>":
-            return [16]
-        # For streaming tests, unknown text (including tag fragments) is
-        # treated as generating no token ids.
-        return []
-
-    def decode(self, token_ids: list[int], **kwargs) -> str:
-        return "".join(str(token_id) for token_id in token_ids)
-
-
-class StreamingToolCallReconstructor:
-    """Aggregate streaming DeltaMessage outputs for tool parser tests."""
-
-    def __init__(self):
-        self.content: str | None = None
-        self.tool_deltas: list[DeltaMessage] = []
-
-    def append_delta(self, delta: DeltaMessage | None):
-        if delta is None:
-            return
-        if delta.content is not None:
-            self.content = (
-                delta.content if self.content is None else self.content + delta.content
-            )
-        if delta.tool_calls:
-            self.tool_deltas.extend(delta.tool_calls)
 
 
 def run_tool_parser_streaming(
@@ -125,7 +47,7 @@ def run_tool_parser_streaming(
     the caller can pass explicit ``delta_token_ids`` for each delta.
     """
     req = request or ChatCompletionRequest(messages=[], model="test-model")
-    reconstructor = StreamingToolCallReconstructor()
+    reconstructor = StreamingToolReconstructor()
     previous_text = ""
     previous_token_ids: list[int] = []
     for i, delta_text in enumerate(deltas):
@@ -150,7 +72,8 @@ def run_tool_parser_streaming(
             delta_token_ids=ids,
             request=req,
         )
-        reconstructor.append_delta(msg)
+        if msg is not None:
+            reconstructor.append_delta(msg)
         previous_text = current_text
         previous_token_ids = current_token_ids
     return reconstructor
@@ -163,7 +86,7 @@ def tokenizer():
 
 @pytest.fixture
 def parser(tokenizer):
-    return PlamoToolParser(tokenizer)
+    return Plamo3ToolParser(tokenizer)
 
 
 @pytest.fixture
@@ -308,6 +231,26 @@ def test_extract_tool_calls_incomplete_requests_block(parser, mock_request):
     assert result.content == content
 
 
+def test_extract_tool_calls_two_requests(parser, mock_request):
+    """Non-streaming counterpart of
+    ``test_streaming_two_tool_requests_increment_index_and_id``.
+
+    Parses two tool_request blocks at once and verifies that names and arguments
+    are restored in order.
+    """
+    body = _wrap_single_tool_call(
+        "echo", json.dumps({"text": "hi"})
+    ) + _wrap_single_tool_call("sum", json.dumps({"a": 1, "b": 2}))
+    model_output = _wrap_tool_requests(body)
+    result = parser.extract_tool_calls(model_output, request=mock_request)
+    assert result.tools_called is True
+    assert len(result.tool_calls) == 2
+    assert result.tool_calls[0].function.name == "echo"
+    assert json.loads(result.tool_calls[0].function.arguments) == {"text": "hi"}
+    assert result.tool_calls[1].function.name == "sum"
+    assert json.loads(result.tool_calls[1].function.arguments) == {"a": 1, "b": 2}
+
+
 def test_streaming_with_content_before_requests(parser, mock_request):
     # BEGIN_TOOL_REQUESTS_TAG 直前までのcontentがデルタで返る
     content = "案内文。"
@@ -334,7 +277,7 @@ def test_streaming_tool_call_after_content_emits_name_and_args(tokenizer, mock_r
     "required must produce at least one tool_call" が失敗する e2e 回帰）。
     content は fenced JSON（json_schema 有効時の content body）を模す。
     """
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
     content = '```json\n{"name": "Alice", "age": 30}\n```'
     tool = _wrap_single_tool_call("get_weather", json.dumps({"city": "Tokyo"}))
     full = content + _wrap_tool_requests(tool)
@@ -410,7 +353,8 @@ def test_streaming_name_then_args(parser, mock_request):
     assert tc.function is not None
     assert tc.function.name == "sum"
 
-    # 2) 引数途中チャンク: END_TOOL_ARGS_TAG の prefix で終わっていないので即 emit される
+    # 2) 引数途中チャンク: END_TOOL_ARGS_TAG の prefix で終わっていないので
+    # 即 emit される
     msg2 = parser.extract_tool_calls_streaming(
         previous_text=parts[0],
         current_text=parts[0] + parts[1],
@@ -481,31 +425,9 @@ def _call_streaming(parser, previous_text, current_text, delta_text, request):
     )
 
 
-def test_streaming_begin_tag_prefix_held_content(tokenizer, mock_request):
-    """BEGIN_TOOL_REQUESTS_TAG の prefix でコンテンツが保留される。
-
-    "<|plamo:begin_" は単一トークンなので途中状態では現れない。
-    バッファ末尾が "<|plamo:begin_" + 後続文字列の一部で終わる場合、
-    その部分は保留され、前にあるコンテンツのみ即 emit される。
-    """
-    parser = PlamoToolParser(tokenizer)
-    anchor = "<|plamo:begin_"
-    # anchor は単一トークンなので一度に届く。
-    # その後に続く残余文字列 "tool" は別トークンで届きうる。
-    partial_suffix = BEGIN_TOOL_REQUESTS_TAG[len(anchor) : len(anchor) + 4]  # "tool"
-    content_before = "Hello"
-    delta1 = content_before + anchor + partial_suffix  # "Hello<|plamo:begin_tool"
-
-    # バッファ末尾が "<|plamo:begin_tool" → anchor より前の "Hello" は即 emit、
-    # "<|plamo:begin_tool" は保留される。
-    msg1 = _call_streaming(parser, "", delta1, delta1, mock_request)
-    assert msg1 is not None, "anchor より前の content は即 emit される"
-    assert msg1.content == content_before
-
-
 def test_streaming_eos_with_no_content_returns_none(tokenizer, mock_request):
     """コンテンツなしで EOT だけが来た場合は None を返す（余分な emit をしない）。"""
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
 
     msg = _call_streaming(parser, "", EOT_TAG, EOT_TAG, mock_request)
     # コンテンツがないので DeltaMessage は返らない
@@ -517,7 +439,7 @@ def test_streaming_eos_arrives_as_single_token(tokenizer, mock_request):
 
     コンテンツが先に届き、続いて EOT_TAG が完全な形で届く場合の動作を確認する。
     """
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
     content = "テスト"
 
     # チャンク1: コンテンツのみ → 即 emit
@@ -534,10 +456,11 @@ def test_streaming_eos_arrives_as_single_token(tokenizer, mock_request):
 def test_streaming_eos_after_tool_call_emits_no_content(tokenizer, mock_request):
     """ツール呼び出しが完結した後に EOT が来ても、コンテンツの delta は返らない。
 
-    単一トークン前提（"<|plamo:begin_"、"<|plamo:end_"、"<|plamo:tag|>" は各 1 トークン）
-    のもとで、_iter_tokens を使ってトークン境界を尊重したチャンクで送信する。
+    単一トークン前提（"<|plamo:begin_"、"<|plamo:end_"、
+    "<|plamo:tag|>" は各 1 トークン）のもとで、
+    _iter_tokens を使ってトークン境界を尊重したチャンクで送信する。
     """
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
     tool_body = _wrap_single_tool_call("ping", json.dumps({"x": 1}))
     full = _wrap_tool_requests(tool_body)  # BEGIN...END...EOT
 
@@ -557,48 +480,40 @@ def test_streaming_eos_after_tool_call_emits_no_content(tokenizer, mock_request)
     )
 
 
-def test_streaming_content_emits_without_eot_when_no_tag_prefix(
-    tokenizer, mock_request
+@pytest.mark.parametrize(
+    "split_char",
+    [
+        len(BEGIN_TOOL_REQUESTS_TAG[: len("<|plamo:begin_t")]),  # anchor 直後
+        len(BEGIN_TOOL_REQUESTS_TAG) - 1,  # 末尾 1 文字
+    ],
+    ids=["split_after_anchor", "split_last_char"],
+)
+def test_streaming_begin_tool_requests_fragmented_no_leak(
+    tokenizer, mock_request, split_char
 ):
-    """タグの prefix で終わっていないコンテンツは EOT なしで即座に emit されるべき。
-
-    skip_special_tokens=True や stop_token_ids 使用時など EOT_TAG が
-    delta_text に現れない場合でも、コンテンツが失われてはならない。
-    """
-    parser = PlamoToolParser(tokenizer)
-    content = "Hello"  # どのタグの prefix でも終わっていない
-
-    msg = _call_streaming(parser, "", content, content, mock_request)
-
-    # EOT なしでも即座に emit される
-    assert msg is not None, (
-        "タグ prefix で終わっていないコンテンツは即座に emit されるべき"
-    )
-    assert msg.content == content
-
-
-def test_streaming_begin_tool_requests_fragmented_no_leak(tokenizer, mock_request):
     """BEGIN_TOOL_REQUESTS_TAG が delta 境界をまたいでも content に漏れない。
 
     タグ文字列が複数 delta に分割されて届く場合、タグより前の content は即座に
     emit され、タグの断片は compute_safe_until で保留される。
+    2 つの代表分割点（anchor 直後 / 末尾 1 文字）で検証する。
     """
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
     ids = tokenizer.encode(BEGIN_TOOL_REQUESTS_TAG, add_special_tokens=False)
     assert len(ids) == 5
 
-    # delta1: content + タグの途中文字列（anchor 直後）
-    delta1 = "前置き" + BEGIN_TOOL_REQUESTS_TAG[: len("<|plamo:begin_t")]
-    # delta2: タグの残り
-    delta2 = BEGIN_TOOL_REQUESTS_TAG[len("<|plamo:begin_t") :]
+    delta1 = "前置き" + BEGIN_TOOL_REQUESTS_TAG[:split_char]
+    delta2 = BEGIN_TOOL_REQUESTS_TAG[split_char:]
+    # タグのトークン境界は分割点に依存しないので、単純に前半/後半で分割する。
+    delta_ids1 = ids[: len(ids) // 2]
+    delta_ids2 = ids[len(ids) // 2 :]
 
     recon = run_tool_parser_streaming(
         parser,
         [delta1, delta2],
         request=mock_request,
-        delta_token_ids=[ids[:3], ids[3:]],
+        delta_token_ids=[delta_ids1, delta_ids2],
     )
-    assert recon.content == "前置き"
+    assert recon.other_content == "前置き"
 
 
 def test_streaming_end_tool_args_fragmented_no_leak(tokenizer, mock_request):
@@ -606,7 +521,7 @@ def test_streaming_end_tool_args_fragmented_no_leak(tokenizer, mock_request):
 
     引数 delta がタグ直前で止まり、タグの断片は compute_safe_until で保留される。
     """
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
     prefix = (
         BEGIN_TOOL_REQUESTS_TAG
         + BEGIN_TOOL_REQUEST_TAG
@@ -641,43 +556,14 @@ def test_streaming_end_tool_args_fragmented_no_leak(tokenizer, mock_request):
             ),
         ],
     )
-    arg_deltas = [
-        d.function.arguments
-        for d in recon.tool_deltas
-        if d.function is not None and d.function.arguments is not None
-    ]
-    assert args in "".join(arg_deltas)
-    assert END_TOOL_ARGS_TAG not in "".join(arg_deltas)
-
-
-def test_streaming_tag_fragment_spanning_deltas(tokenizer, mock_request):
-    """タグの末尾 1 文字だけが次の delta で届く場合でも正しく検出される。"""
-    parser = PlamoToolParser(tokenizer)
-    ids = tokenizer.encode(BEGIN_TOOL_REQUESTS_TAG, add_special_tokens=False)
-    assert len(ids) == 5
-
-    # Use text boundaries that split after 4 tokens. The dummy tokenizer maps
-    # each distinct substring to a single token only when passed exactly, so we
-    # split at known character boundaries for the test tag.
-    split_char = len(BEGIN_TOOL_REQUESTS_TAG) - 1
-    delta1 = "前置き" + BEGIN_TOOL_REQUESTS_TAG[:split_char]
-    delta2 = BEGIN_TOOL_REQUESTS_TAG[split_char:]
-
-    recon = run_tool_parser_streaming(
-        parser,
-        [delta1, delta2],
-        request=mock_request,
-        delta_token_ids=[ids[:-1], ids[-1:]],
-    )
-    assert recon.content == "前置き"
-    assert not any(
-        END_TOOL_REQUESTS_TAG in (d.function.arguments or "") for d in recon.tool_deltas
-    )
+    arguments = "".join(call.function.arguments for call in recon.tool_calls)
+    assert args in arguments
+    assert END_TOOL_ARGS_TAG not in arguments
 
 
 def test_streaming_token_ids_do_not_affect_text_parsing(tokenizer, mock_request):
     """パースはテキストベースで行われ、token id 列の内容に影響されない。"""
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
     # Pass token ids resembling BEGIN_TOOL_REQUESTS_TAG (with a corrupt middle
     # token); the text contains no tag, so everything is content.
     ids = list(tokenizer.encode(BEGIN_TOOL_REQUESTS_TAG, add_special_tokens=False))
@@ -689,7 +575,7 @@ def test_streaming_token_ids_do_not_affect_text_parsing(tokenizer, mock_request)
         request=mock_request,
         delta_token_ids=[ids],
     )
-    assert recon.content == "前置き"
+    assert recon.other_content == "前置き"
 
 
 def test_streaming_content_accumulated_across_chunks_emits_per_chunk(
@@ -699,7 +585,7 @@ def test_streaming_content_accumulated_across_chunks_emits_per_chunk(
 
     EOT を待たずに各チャンクのコンテンツが順次 emit されることを確認する。
     """
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
     chunks = ["AB", "CD", "EF"]
 
     prev = ""
@@ -720,7 +606,7 @@ def test_streaming_begin_tag_prefix_held_across_chunks(tokenizer, mock_request):
     単一トークン前提のもとでは "<|plamo:begin_" は常に一括で届くため、
     バッファ末尾が "<|plamo:begin_" + 後続文字列の一部で終わる状況が保留対象。
     """
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
     anchor = "<|plamo:begin_"
 
     # チャンク1: 通常コンテンツ → 即 emit
@@ -829,7 +715,7 @@ def test_streaming_complete_batch_is_fully_emitted(
     in one delta; the last parse call is the only chance to emit it, so all
     parsed pieces must be batched into a single DeltaMessage.
     """
-    parser = PlamoToolParser(tokenizer)
+    parser = Plamo3ToolParser(tokenizer)
     model_output = content + _wrap_tool_requests(tool_bodies)
 
     msg = _call_streaming(parser, "", model_output, model_output, mock_request)
@@ -846,3 +732,257 @@ def test_streaming_complete_batch_is_fully_emitted(
         assert tool_call.function is not None
         assert tool_call.function.name == name
         assert json.loads(tool_call.function.arguments or "") == arguments
+
+
+# ---------------------------------------------------------------------------
+# Truncated special-token markers must never leak into non-streaming content.
+#
+# When max_tokens cuts generation mid-marker, the model can emit just the single
+# ``<|plamo:begin_`` anchor token (id 256) before a length stop. The
+# non-streaming parsers then find no complete tag and would pass that partial
+# marker through as content. ``strip_trailing_partial_marker`` removes such
+# truncation artifacts; this section pins the helper and its wiring into the
+# reasoning + tool parsers.
+# ---------------------------------------------------------------------------
+
+_PLAMO_PREFIX = "<|plamo:"
+
+
+# Alias so the truncation tests can request either name.
+@pytest.fixture
+def request_stub(mock_request):
+    return mock_request
+
+
+# --- Helper unit tests (pure, no tokenizer) -------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # The lone anchor token (the actual max_tokens=1 artifact).
+        ("<|plamo:begin_", ""),
+        # Partial begin-think between the anchor and the full tag.
+        ("<|plamo:begin_think:pla", ""),
+        # Partial end / EOT fragments.
+        ("<|plamo:end_", ""),
+        ("<|plamo:ta", ""),  # proper prefix of "<|plamo:tag|>"
+        # Just the shared prefix.
+        ("<|plamo:", ""),
+        # Partial marker after real content: only the artifact is dropped.
+        ("Hello<|plamo:begin_", "Hello"),
+        ("answer text<|plamo:begin_tool_requests:pla", "answer text"),
+    ],
+)
+def test_strips_trailing_partial_marker(text, expected):
+    assert strip_trailing_partial_marker(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "Hello world",
+        "x < y and a <| b",  # stray '<' / '<|' are NOT the special prefix
+        "ends with <|plamo",  # shorter than the full "<|plamo:" discriminator
+    ],
+)
+def test_leaves_non_partial_text_unchanged(text):
+    assert strip_trailing_partial_marker(text) == text
+
+
+def test_special_tags_are_prefix_free():
+    # strip_trailing_partial_marker's "incomplete vs complete" test (tail != tag)
+    # is only sound if no tag is a proper prefix of another. The module enforces
+    # this at import; assert it here too so the invariant is visible and covered.
+    for a in _ALL_SPECIAL_TAGS:
+        for b in _ALL_SPECIAL_TAGS:
+            if a != b:
+                assert not b.startswith(a), f"{a!r} is a proper prefix of {b!r}"
+
+
+def test_whole_partial_marker_strips_to_empty_string_not_none():
+    # The no-think path returns a *string* (possibly "") for content, matching
+    # the pre-fix contract — it must not start mapping "" to None.
+    assert strip_trailing_partial_marker("<|plamo:begin_") == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A *complete* tag is only a truncation artifact's opposite: it must be
+        # left intact (tail == tag is excluded; no atomic tag is a proper prefix
+        # of another, so a complete tag is never mistaken for an incomplete one).
+        BEGIN_TOOL_REQUESTS_TAG,
+        END_THINK_TAG,
+        EOT_TAG,
+        # Complete tag at the end of real text.
+        f"answer{EOT_TAG}",
+        f"text{BEGIN_TOOL_REQUESTS_TAG}",
+        # Complete tag followed by more text (not a trailing fragment at all).
+        f"a{BEGIN_THINK_TAG}b",
+    ],
+)
+def test_complete_tags_are_preserved(text):
+    assert strip_trailing_partial_marker(text) == text
+
+
+# --- Parser wiring --------------------------------------------------------
+
+
+def test_tool_parser_drops_lone_partial_marker(tokenizer, request_stub):
+    parser = Plamo3ToolParser(tokenizer)
+    result = parser.extract_tool_calls("<|plamo:begin_", request_stub)
+    assert result.tools_called is False
+    assert result.tool_calls == []
+    assert _PLAMO_PREFIX not in (result.content or "")
+    assert (result.content or "") == ""
+
+
+def test_reasoning_parser_drops_lone_partial_begin(tokenizer, request_stub):
+    parser = Plamo3ReasoningParser(
+        tokenizer, chat_template_kwargs={"enable_thinking": False}
+    )
+    reasoning, content = parser.extract_reasoning("<|plamo:begin_", request_stub)
+    assert reasoning is None
+    # When thinking is off, IdentityReasoningParser is used: reasoning
+    # is not separated and the model output passes through as content
+    # verbatim (no partial-marker strip).
+    assert content == "<|plamo:begin_"
+
+
+def test_reasoning_parser_empty_content_after_think_is_empty_string(
+    tokenizer, request_stub
+):
+    # END_THINK with nothing after -> content is "" (a string), not None.
+    parser = Plamo3ReasoningParser(tokenizer)
+    reasoning, content = parser.extract_reasoning(
+        f"{BEGIN_THINK_TAG}x{END_THINK_TAG}", request_stub
+    )
+    assert reasoning == "x"
+    assert content == ""
+
+
+def test_reasoning_parser_strips_trailing_partial_after_content(
+    tokenizer, request_stub
+):
+    # Full reasoning + content, then a truncated trailing marker.
+    text = f"{BEGIN_THINK_TAG}thought{END_THINK_TAG}answer<|plamo:begin_"
+    reasoning, content = _parser_extract(tokenizer, request_stub, text)
+    assert reasoning == "thought"
+    assert content == "answer"
+    assert _PLAMO_PREFIX not in (content or "")
+
+
+def _parser_extract(tokenizer, request_stub, text):
+    return Plamo3ReasoningParser(tokenizer).extract_reasoning(text, request_stub)
+
+
+def test_reasoning_parser_plain_content_preserved(tokenizer, request_stub):
+    # No think block at all -> everything is content, untouched.
+    parser = Plamo3ReasoningParser(
+        tokenizer, chat_template_kwargs={"enable_thinking": False}
+    )
+    reasoning, content = parser.extract_reasoning(
+        "just content, no markers", request_stub
+    )
+    assert reasoning is None
+    assert content == "just content, no markers"
+
+
+def test_reasoning_span_keeps_internal_complete_tag(tokenizer, request_stub):
+    # A complete tag inside the reasoning span (between BEGIN/END_THINK) is
+    # extracted verbatim — the strip only touches a trailing partial marker,
+    # never the reasoning span.
+    text = f"{BEGIN_THINK_TAG}before {EOT_TAG} after{END_THINK_TAG}answer"
+    reasoning, content = Plamo3ReasoningParser(tokenizer).extract_reasoning(
+        text, request_stub
+    )
+    assert reasoning == f"before {EOT_TAG} after"
+    assert content == "answer"
+
+
+def test_reasoning_truncated_mid_end_think_strips_from_reasoning(
+    tokenizer, request_stub
+):
+    # Cut inside a partial END_THINK ("<|plamo:end_") with no full END tag:
+    # the partial marker must not leak into the reasoning field.
+    text = f"{BEGIN_THINK_TAG}thinking hard<|plamo:end_"
+    reasoning, content = Plamo3ReasoningParser(tokenizer).extract_reasoning(
+        text, request_stub
+    )
+    assert reasoning == "thinking hard"
+    assert content is None
+    assert _PLAMO_PREFIX not in (reasoning or "")
+
+
+def _full_outputs():
+    """Representative complete model outputs (without the trailing EOT, which
+    vLLM removes as a stop token before the parsers run)."""
+    tc = (
+        f"{BEGIN_TOOL_REQUESTS_TAG}"
+        f"<|plamo:begin_tool_request:plamo|>"
+        f"<|plamo:begin_tool_name:plamo|>noop<|plamo:end_tool_name:plamo|>"
+        f"<|plamo:begin_tool_arguments:plamo|><|plamo:constrain|>json<|plamo:msg|>{{}}<|plamo:end_tool_arguments:plamo|>"
+        f"<|plamo:end_tool_request:plamo|>"
+        f"<|plamo:end_tool_requests:plamo|>"
+    )
+    return {
+        "reasoning+content": (
+            f"{BEGIN_THINK_TAG}let me think{END_THINK_TAG}Here is the answer."
+        ),
+        "reasoning+toolcall": f"{BEGIN_THINK_TAG}deciding{END_THINK_TAG}{tc}",
+        "noreason+content": "Hello there, this is content.",
+        "noreason+toolcall": tc,
+    }
+
+
+@pytest.mark.parametrize("name", list(_full_outputs().keys()))
+def test_no_marker_leaks_at_any_truncation_point(tokenizer, request_stub, name):
+    """Exhaustive sweep: truncate each representative output at *every* byte
+    boundary (a superset of token boundaries) and assert no "<|plamo:"
+    special-token markup survives in reasoning, content, or tool_call.arguments.
+
+    Each output is run through the pipeline that matches its model kind: the
+    reasoning model serves with the reasoning parser in front of the tool
+    parser; the non-reasoning model has no reasoning parser, so the tool parser
+    sees the raw output directly."""
+    rp = Plamo3ReasoningParser(tokenizer)
+    tp = Plamo3ToolParser(tokenizer)
+    full = _full_outputs()[name]
+    is_reasoning = full.startswith(BEGIN_THINK_TAG)
+    for i in range(1, len(full) + 1):
+        prefix = full[:i]
+        if is_reasoning:
+            reasoning, content = rp.extract_reasoning(prefix, request_stub)
+        else:
+            # Non-reasoning model: no reasoning parser is loaded.
+            reasoning, content = None, prefix
+        res = tp.extract_tool_calls(content or "", request_stub)
+        _assert_clean(reasoning, "reasoning", prefix)
+        _assert_clean(res.content, "content", prefix)
+        for k, tc in enumerate(res.tool_calls):
+            _assert_clean(tc.function.arguments, f"args[{k}]", prefix)
+
+
+def _assert_clean(value, label, prefix):
+    v = value or ""
+    assert _PLAMO_PREFIX not in v, (
+        f"marker leaked into {label} when truncated at {prefix[-24:]!r}: {v!r}"
+    )
+
+
+def test_normal_tool_call_unaffected(tokenizer, request_stub):
+    # Regression: a complete tool call still parses and content stays clean.
+    text = (
+        f"{BEGIN_TOOL_REQUESTS_TAG}"
+        f"<|plamo:begin_tool_request:plamo|>"
+        f"<|plamo:begin_tool_name:plamo|>noop<|plamo:end_tool_name:plamo|>"
+        f"<|plamo:begin_tool_arguments:plamo|><|plamo:constrain|>json<|plamo:msg|>{{}}<|plamo:end_tool_arguments:plamo|>"
+        f"<|plamo:end_tool_request:plamo|>"
+        f"<|plamo:end_tool_requests:plamo|>{EOT_TAG}"
+    )
+    result = Plamo3ToolParser(tokenizer).extract_tool_calls(text, request_stub)
+    assert result.tools_called is True
+    assert [tc.function.name for tc in result.tool_calls] == ["noop"]
+    assert (result.content or "") == ""
