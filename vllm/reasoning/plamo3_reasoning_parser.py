@@ -428,7 +428,8 @@ class Plamo3ReasoningParser(ReasoningParser):
         )
         end_tag_start = model_output.find(END_THINK_TAG, begin_tag_end)
         if end_tag_start == -1:
-            return strip_trailing_partial_marker(model_output[begin_tag_end:]), None
+            reasoning = strip_trailing_partial_marker(model_output[begin_tag_end:])
+            return reasoning or None, None
 
         end_tag_end = end_tag_start + len(END_THINK_TAG)
         reasoning = model_output[begin_tag_end:end_tag_start]
