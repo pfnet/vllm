@@ -266,7 +266,6 @@ class Plamo3ReasoningParser(ReasoningParser):
         return -1
 
     def _effective_input_ids(self, input_ids: Sequence[int]) -> list[int]:
-        """Use accumulated IDs when vLLM passes only the current delta."""
         return self._stream_token_ids or list(input_ids)
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
@@ -304,12 +303,12 @@ class Plamo3ReasoningParser(ReasoningParser):
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         if self._identity_parser is not None:
             return self._identity_parser.extract_content_ids(input_ids)
-        # Some vLLM call paths pass only delta token IDs; use the accumulated
-        # stream.
+
         ids = self._effective_input_ids(input_ids)
         end_start = self._find_end_think(ids)
         if end_start == -1:
             return []
+
         return ids[end_start + len(self._end_think_token_ids) :]
 
     def extract_reasoning_streaming(
@@ -421,46 +420,17 @@ class Plamo3ReasoningParser(ReasoningParser):
         model_output: str,
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
-        """
-        Extract reasoning content from a complete model-generated string.
-
-        Used for non-streaming responses where we have the entire model response
-        available before sending to the client.
-
-        Parameters:
-        model_output: str
-            The model-generated string to extract reasoning content from.
-
-        request: ChatCompletionRequest
-            The request object that was used to generate the model_output.
-
-        Returns:
-        tuple[Optional[str], Optional[str]]
-            A tuple containing the reasoning content and the content.
-        """
         if self._identity_parser is not None:
             return self._identity_parser.extract_reasoning(model_output, request)
-        if model_output.startswith(BEGIN_THINK_TAG):
-            begin_tag_end = len(BEGIN_THINK_TAG)
-        else:
-            # Thinking is enabled: the chat template may have injected the
-            # begin-think tag into the prompt, so the output starts directly
-            # with reasoning.
-            begin_tag_end = 0
+
+        begin_tag_end = (
+            len(BEGIN_THINK_TAG) if model_output.startswith(BEGIN_THINK_TAG) else 0
+        )
         end_tag_start = model_output.find(END_THINK_TAG, begin_tag_end)
         if end_tag_start == -1:
-            # END_THINK not found: the turn was cut inside the reasoning span.
-            # If the tail is a partial END_THINK (or other) marker from a
-            # max_tokens cut, strip it so no special-token markup leaks into
-            # reasoning/content either.
             return strip_trailing_partial_marker(model_output[begin_tag_end:]), None
+
         end_tag_end = end_tag_start + len(END_THINK_TAG)
         reasoning = model_output[begin_tag_end:end_tag_start]
-        # Return content as a plain string (possibly ""), never None: this value
-        # is fed to the tool parser downstream (vllm serving extracts tool calls
-        # "exclusively from the content"), and vllm itself normalises the final
-        # message.content to None for tool-call responses. Nulling here would be
-        # redundant and risks the assert-content-is-not-None branches in vllm's
-        # tool-choice handling.
         content = strip_trailing_partial_marker(model_output[end_tag_end:])
         return reasoning, content
