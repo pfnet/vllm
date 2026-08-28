@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import json
-
 import pytest
 
 from tests.reasoning.test_plamo3_reasoning_parser import _DummyTokenizer
@@ -79,18 +77,25 @@ def test_extract_tool_calls(parser, model_output, expected_content, expected_cal
 
 
 def test_extract_tool_calls_rejects_incomplete_request(parser):
-    model_output = (
-        "Before tools."
-        f"{BEGIN_TOOL_REQUESTS_TAG}{BEGIN_TOOL_REQUEST_TAG}"
-        f"{BEGIN_TOOL_NAME_TAG}broken{END_TOOL_NAME_TAG}"
-        f'{BEGIN_TOOL_ARGS_TAG}{{"a": 1}}'
-    )
+    name_prefix = BEGIN_TOOL_REQUEST_TAG + BEGIN_TOOL_NAME_TAG + "broken"
+    named_request = name_prefix + END_TOOL_NAME_TAG
+    arguments_prefix = named_request + BEGIN_TOOL_ARGS_TAG + '{"a": 1}'
+    for incomplete_request in [
+        "",
+        BEGIN_TOOL_REQUEST_TAG,
+        name_prefix,
+        named_request,
+        arguments_prefix,
+        arguments_prefix + END_TOOL_ARGS_TAG,
+        _tool_call("broken", '{"a": 1}'),
+    ]:
+        model_output = "Before tools." + BEGIN_TOOL_REQUESTS_TAG + incomplete_request
 
-    result = run_tool_extraction_nonstreaming(parser, model_output)
+        result = run_tool_extraction_nonstreaming(parser, model_output)
 
-    assert result.content == "Before tools."
-    assert result.tools_called is False
-    assert result.tool_calls == []
+        assert result.content == "Before tools."
+        assert result.tools_called is False
+        assert result.tool_calls == []
 
 
 def test_extract_tool_calls_strips_truncated_marker(parser):
@@ -140,9 +145,7 @@ def test_streaming_content_then_tool_call(parser):
     assert reconstructor.other_content == "Checking the weather."
     assert len(reconstructor.tool_calls) == 1
     assert reconstructor.tool_calls[0].function.name == "get_weather"
-    assert json.loads(reconstructor.tool_calls[0].function.arguments) == {
-        "city": "Tokyo"
-    }
+    assert reconstructor.tool_calls[0].function.arguments == '{"city": "Tokyo"}'
 
 
 def test_streaming_holds_fragmented_delimiters(parser):
@@ -174,6 +177,35 @@ def test_streaming_holds_fragmented_delimiters(parser):
     assert len(reconstructor.tool_calls) == 1
     assert reconstructor.tool_calls[0].function.name == "sum"
     assert reconstructor.tool_calls[0].function.arguments == '{"a": 1}'
+
+
+def test_streaming_handles_incomplete_request_boundaries():
+    name_prefix = BEGIN_TOOL_REQUEST_TAG + BEGIN_TOOL_NAME_TAG + "sum"
+    named_request = name_prefix + END_TOOL_NAME_TAG
+    arguments_prefix = named_request + BEGIN_TOOL_ARGS_TAG + '{"a": 1}'
+    for incomplete_request, expected_calls in [
+        ("", []),
+        (BEGIN_TOOL_REQUEST_TAG, []),
+        (name_prefix, []),
+        (named_request, [("sum", "")]),
+        (arguments_prefix, [("sum", '{"a": 1}')]),
+        (arguments_prefix + END_TOOL_ARGS_TAG, [("sum", '{"a": 1}')]),
+        (_tool_call("sum", '{"a": 1}'), [("sum", '{"a": 1}')]),
+        (
+            _tool_call("sum", '{"a": 1}') + END_TOOL_REQUESTS_TAG,
+            [("sum", '{"a": 1}')],
+        ),
+    ]:
+        reconstructor = run_tool_extraction_streaming(
+            Plamo3ToolParser(_DummyTokenizer()),
+            ["Before tools." + BEGIN_TOOL_REQUESTS_TAG + incomplete_request],
+        )
+
+        assert reconstructor.other_content == "Before tools."
+        assert [
+            (call.function.name, call.function.arguments)
+            for call in reconstructor.tool_calls
+        ] == expected_calls
 
 
 def test_streaming_complete_batch_emits_parallel_calls(parser):

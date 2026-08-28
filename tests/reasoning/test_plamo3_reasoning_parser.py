@@ -35,19 +35,16 @@ class _DummyTokenizer:
         return "".join(tokens)
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        # Grammar anchors (single-token prefixes/suffixes)
         if text == "<|plamo:begin_":
             return [256]
         if text == "<|plamo:end_":
             return [257]
         if text == ":plamo|>":
             return [258]
-        # Reasoning tags
         if text == "<|plamo:begin_think:plamo|>":
             return [256, 21279, 258]
         if text == "<|plamo:end_think:plamo|>":
             return [257, 21279, 258]
-        # Tool tags
         if text == "<|plamo:begin_tool_requests:plamo|>":
             return [256, 13672, 95, 31026, 258]
         if text == "<|plamo:end_tool_requests:plamo|>":
@@ -60,7 +57,6 @@ class _DummyTokenizer:
             return [256, 13672, 50416, 258]
         if text == "<|plamo:end_tool_name:plamo|>":
             return [257, 13672, 50416, 258]
-        # Composite BEGIN_TOOL_ARGS_TAG
         if text == (
             "<|plamo:begin_tool_arguments:plamo|><|plamo:constrain|>json<|plamo:msg|>"
         ):
@@ -133,6 +129,8 @@ def test_extract_content_ids(enable_thinking, input_ids, expected, tokenizer):
         ),
         (True, "reasoning in progress", "reasoning in progress", None),
         (True, f"reasoning{END_THINK_TAG}answer", "reasoning", "answer"),
+        (True, BEGIN_THINK_TAG, None, None),
+        (True, BEGIN_THINK_TAG[:-1], None, None),
         (
             True,
             f"{BEGIN_THINK_TAG}reasoning in progress",
@@ -162,6 +160,8 @@ def test_non_streaming_extract_reasoning(
 @pytest.mark.parametrize(
     ("enable_thinking", "deltas", "expected_reasoning", "expected_content"),
     [
+        (True, [BEGIN_THINK_TAG], None, None),
+        (True, [BEGIN_THINK_TAG[:-1]], None, None),
         (
             True,
             [BEGIN_THINK_TAG, "reasoning", END_THINK_TAG, "answer"],
@@ -229,7 +229,6 @@ def _call_reasoning_streaming(parser, previous_text, current_text, delta_text):
 
 def test_delta_message_kinds(tokenizer):
     parser = Plamo3ReasoningParser(tokenizer)
-    _call_reasoning_streaming(parser, "", BEGIN_THINK_TAG, BEGIN_THINK_TAG)
     steps = [
         ("", BEGIN_THINK_TAG, BEGIN_THINK_TAG, None, None),
         (BEGIN_THINK_TAG, BEGIN_THINK_TAG + "abc", "abc", "abc", None),
@@ -267,6 +266,31 @@ def test_delta_message_kinds(tokenizer):
         )
 
 
+def test_streaming_empty_and_immediate_reasoning_end(tokenizer):
+    parser = Plamo3ReasoningParser(tokenizer)
+
+    assert _call_reasoning_streaming(parser, "", "", "") is None
+    assert (
+        _call_reasoning_streaming(
+            parser,
+            "",
+            BEGIN_THINK_TAG + END_THINK_TAG,
+            BEGIN_THINK_TAG + END_THINK_TAG,
+        )
+        is None
+    )
+
+    message = _call_reasoning_streaming(
+        parser,
+        BEGIN_THINK_TAG + END_THINK_TAG,
+        BEGIN_THINK_TAG + END_THINK_TAG + "answer",
+        "answer",
+    )
+    assert message is not None
+    assert message.reasoning is None
+    assert message.content == "answer"
+
+
 @pytest.mark.parametrize(
     ("enable_thinking", "input_ids", "expected"),
     [
@@ -295,6 +319,12 @@ def test_is_reasoning_end(enable_thinking, input_ids, expected, tokenizer):
         (True, _BEGIN_IDS + [42], [42], False),
         (True, [1] + _BEGIN_IDS + [42], [42], False),
         (False, [100, 200], [200], True),
+        (True, _BEGIN_IDS + [42, _END0], [_END0], False),
+        (True, _BEGIN_IDS + [42, _END0, _END1], [_END1], False),
+        (True, _BEGIN_IDS + [42] + _END_IDS, [_END2], True),
+        (True, _BEGIN_IDS + [42] + _END_IDS, _END_IDS, True),
+        (True, _BEGIN_IDS + [42, _END0, _END1], [_END0, _END1], False),
+        (True, _BEGIN_IDS + [42] + _END_IDS + [99], [99], False),
     ],
 )
 def test_is_reasoning_end_streaming(
@@ -313,27 +343,22 @@ def test_is_reasoning_end_after_streaming_started(tokenizer):
     assert parser.is_reasoning_end([100] + _END_IDS + [42]) is True
 
 
-@pytest.mark.parametrize(
-    ("input_ids", "delta_ids", "expected"),
-    [
-        (_BEGIN_IDS + [42, _END0], [_END0], False),
-        (_BEGIN_IDS + [42, _END0, _END1], [_END1], False),
-        (_BEGIN_IDS + [42] + _END_IDS, [_END2], True),
-        (_BEGIN_IDS + [42] + _END_IDS, _END_IDS, True),
-        (_BEGIN_IDS + [42, _END0, _END1], [_END0, _END1], False),
-        (_BEGIN_IDS + [42] + _END_IDS + [99], [99], False),
-    ],
-)
-def test_is_reasoning_end_streaming_with_three_token_tag(
-    input_ids, delta_ids, expected, tokenizer
-):
+def test_extract_content_ids_uses_accumulated_stream_tokens(tokenizer):
     parser = Plamo3ReasoningParser(tokenizer)
-    assert parser.is_reasoning_end_streaming(input_ids, delta_ids) is expected
+    streamed_ids = _BEGIN_IDS + [42] + _END_IDS + [99]
+    parser.extract_reasoning_streaming(
+        previous_text="",
+        current_text=BEGIN_THINK_TAG + "reasoning" + END_THINK_TAG + "answer",
+        delta_text=BEGIN_THINK_TAG + "reasoning" + END_THINK_TAG + "answer",
+        previous_token_ids=[],
+        current_token_ids=streamed_ids,
+        delta_token_ids=streamed_ids,
+    )
+
+    assert parser.extract_content_ids([0]) == [99]
 
 
 class _Plamo3DelegatingParser(DelegatingParser):
-    """Exercise the reasoning-to-named-tool streaming handoff."""
-
     reasoning_parser_cls = Plamo3ReasoningParser
     tool_parser_cls = Plamo3ToolParser
 
@@ -385,8 +410,8 @@ def _run_named_tool_stream(tokenizer, chunks):
                 (BEGIN_THINK_TAG, _BEGIN_IDS),
                 ("reasoning", [100]),
                 (END_THINK_TAG, _END_IDS),
-                ("C1", [200]),
-                ("C2", [201]),
+                ("answer-1", [200]),
+                ("answer-2", [201]),
             ],
             id="end_and_content_separate",
         ),
@@ -394,8 +419,8 @@ def _run_named_tool_stream(tokenizer, chunks):
             [
                 (BEGIN_THINK_TAG, _BEGIN_IDS),
                 ("reasoning", [100]),
-                (END_THINK_TAG + "C1", _END_IDS + [200]),
-                ("C2", [201]),
+                (END_THINK_TAG + "answer-1", _END_IDS + [200]),
+                ("answer-2", [201]),
             ],
             id="end_and_first_content_same_chunk",
         ),
@@ -405,18 +430,17 @@ def _run_named_tool_stream(tokenizer, chunks):
                 ("reasoning", [100]),
                 ("<|plamo:end_", [_END0]),
                 ("", [_END1]),
-                ("think:plamo|>C1", [_END2, 200]),
-                ("C2", [201]),
+                ("think:plamo|>answer-1", [_END2, 200]),
+                ("answer-2", [201]),
             ],
             id="end_spans_chunks_first_content_with_final_token",
         ),
     ],
 )
 def test_named_tool_streaming_content_survives_reasoning_end(tokenizer, chunks):
-    """The named-tool path must receive content at every END_THINK boundary."""
     reasoning, arguments = _run_named_tool_stream(tokenizer, chunks)
     assert reasoning == "reasoning"
-    assert arguments == "C1C2"
+    assert arguments == "answer-1answer-2"
 
 
 def test_init_rejects_empty_think_tag_tokenization():
@@ -432,7 +456,6 @@ def test_init_rejects_empty_think_tag_tokenization():
     ("buf", "floor", "additional_tags", "expected"),
     [
         ("abc", 0, [], 3),
-        ("plain text with no tag prefix at the end", 0, [], 40),
         ("reasoning text<|pla", 0, [], 14),
         ("reasoning text<|plamo:end_thin", 0, [], 14),
         (f"reasoning text{END_THINK_TAG}", 0, [], 39),
