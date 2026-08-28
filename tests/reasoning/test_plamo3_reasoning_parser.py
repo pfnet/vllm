@@ -12,6 +12,7 @@ from vllm.reasoning.plamo3_reasoning_parser import (
     BEGIN_THINK_TAG,
     BEGIN_TOOL_REQUESTS_TAG,
     END_THINK_TAG,
+    EOT_TAG,
     Plamo3ReasoningParser,
     compute_safe_until,
 )
@@ -127,8 +128,10 @@ def test_extract_content_ids(enable_thinking, input_ids, expected, tokenizer):
             None,
             f"{BEGIN_THINK_TAG}reasoning{END_THINK_TAG}answer",
         ),
+        (False, f"answer{EOT_TAG}ignored", None, "answer"),
         (True, "reasoning in progress", "reasoning in progress", None),
         (True, f"reasoning{END_THINK_TAG}answer", "reasoning", "answer"),
+        (True, f"reasoning{EOT_TAG}ignored", "reasoning", None),
         (True, BEGIN_THINK_TAG, None, None),
         (True, BEGIN_THINK_TAG[:-1], None, None),
         (
@@ -143,6 +146,13 @@ def test_extract_content_ids(enable_thinking, input_ids, expected, tokenizer):
             "reasoning",
             "answer",
         ),
+        (
+            True,
+            f"{BEGIN_THINK_TAG}reasoning{END_THINK_TAG}answer{EOT_TAG}ignored",
+            "reasoning",
+            "answer",
+        ),
+        (True, f"{BEGIN_THINK_TAG}reasoning{EOT_TAG}ignored", "reasoning", None),
     ],
 )
 def test_non_streaming_extract_reasoning(
@@ -168,6 +178,29 @@ def test_non_streaming_extract_reasoning(
             "reasoning",
             "answer",
         ),
+        (
+            True,
+            [BEGIN_THINK_TAG, "reasoning", END_THINK_TAG, "answer", EOT_TAG, "ignored"],
+            "reasoning",
+            "answer",
+        ),
+        (
+            True,
+            [
+                BEGIN_THINK_TAG,
+                "reasoning",
+                END_THINK_TAG + "answer" + EOT_TAG + "ignored",
+            ],
+            "reasoning",
+            "answer",
+        ),
+        (
+            True,
+            [BEGIN_THINK_TAG, "reasoning", EOT_TAG, "ignored"],
+            "reasoning",
+            None,
+        ),
+        (True, ["reasoning", EOT_TAG, "ignored"], "reasoning", None),
         (
             True,
             [
@@ -202,6 +235,8 @@ def test_non_streaming_extract_reasoning(
             None,
             f"prefix{BEGIN_THINK_TAG}ignored reasoning{END_THINK_TAG}suffix",
         ),
+        (False, ["answer", EOT_TAG, "ignored"], None, "answer"),
+        (False, [f"answer{EOT_TAG}ignored", "later"], None, "answer"),
     ],
 )
 def test_streaming_reasoning_extraction(

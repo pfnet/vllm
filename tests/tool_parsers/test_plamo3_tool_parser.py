@@ -44,7 +44,7 @@ def _tool_requests(*calls: str) -> str:
     ("model_output", "expected_content", "expected_calls"),
     [
         ("Regular response", "Regular response", []),
-        (f"Regular response{EOT_TAG}", "Regular response", []),
+        (f"Regular response{EOT_TAG}ignored", "Regular response", []),
         (
             "Checking the weather."
             + _tool_requests(_tool_call("get_weather", '{"city": "Tokyo"}')),
@@ -110,7 +110,7 @@ def test_extract_tool_calls_strips_truncated_marker(parser):
     ("deltas", "expected_content"),
     [
         (["Regular response"], "Regular response"),
-        (["Regular response", EOT_TAG], "Regular response"),
+        ([f"Regular response{EOT_TAG}ignored", "later"], "Regular response"),
     ],
     ids=["no_eot", "eot"],
 )
